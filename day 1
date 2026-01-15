@@ -1,0 +1,14 @@
+print("hello python")
+print("我准备用python做交易数据分析和量化交易!")
+#trade_pnl,py
+#计算多单的盈亏
+entry_price=27000   #入场价格
+exit_price=26522    #平仓价格
+position_size=0.05  #仓位(0.05BTC)
+pnl=(exit_price-entry_price)*position_size
+#盈亏=价差*仓位
+print("入场价:",entry_price)
+print("平仓价:",exit_price)
+print("持仓数量:",position_size,"BTC")
+print("本次交易盈亏:",pnl,"USD")
+print("本次交易盈亏(四舍五入):",round(pnl,2),"USD")

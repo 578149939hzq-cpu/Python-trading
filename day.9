@@ -1,0 +1,18 @@
+import numpy as np
+prices_list=[100,101,102,104,107]
+
+#把python列表转换成Numpy数组
+prices=np.array(prices_list)
+
+print("原始价格数组:",prices)
+print("类型:",type(prices))
+
+#用切片计算驻日收益率:r_t=p_t/p_{t-1}-1
+#price[1:]=第二个到最后一个
+#price[:-1]=第一个到倒数第二个
+
+returns=prices[1:]/prices[:-1]-1 ##向量化计算
+
+print("逐日收益率:",[f"{x:.2%}"for x in returns])
+print(f"平均收益率:,{returns.mean():.2%}")#mean 均值
+print(f"收益率标准差:,{returns.std():.2%}")# std 标准差-波动率
