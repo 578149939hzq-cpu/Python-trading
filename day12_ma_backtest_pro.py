@@ -8,24 +8,76 @@ PARAMS = {
     "fee_rate": 0.0005,
     "initial_capital": 10000
 }
-
-# ==== 1. 数据加载模块 ====
+ #数据加载模块
 def load_price_data(csv_path: str) -> pd.DataFrame:
-    # 修正1: skiprows (复数)
-    df = pd.read_csv(csv_path, skiprows=1)
-    
-    # 修正2: lower() 是函数，要加括号
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    # 1. 初次尝试读取
+    try:
+        # low_memory=False 防止混合类型警告
+        df = pd.read_csv(csv_path, low_memory=False)
+    except Exception as e:
+        print(f"❌ 读取文件失败: {e}")
+        return pd.DataFrame()
 
-    # 时间戳清洗逻辑 (保持你之前的修正)
-    df["unix"] = pd.to_numeric(df["unix"], errors='coerce')
-    mask_micro = df["unix"] > 1e14 
-    df.loc[mask_micro, "unix"] = df.loc[mask_micro, "unix"] / 1000
-    df["time"] = pd.to_datetime(df["unix"], unit="ms")
+    # 🕵️‍♂️ 智能检测 1: 检查是否有垃圾表头 (跳过网址行)
+    if len(df) > 0 and ("http" in str(df.columns[0]) or "www" in str(df.columns[0])):
+        print(f"   ⚠️ 检测到元数据表头，自动修正读取...")
+        df = pd.read_csv(csv_path, skiprows=1, low_memory=False)
+
+    # 2. 统一列名
+    df.columns = [c.strip().lower() for c in df.columns]
     
+    # 3. 智能识别时间列
+    if "timestamp" in df.columns:
+        df["time"] = pd.to_datetime(df["timestamp"])
+        
+    elif "unix" in df.columns:
+        # 转为数字，错误变成 NaN
+        df["unix"] = pd.to_numeric(df["unix"], errors='coerce')
+        
+        # --- 🕵️‍♂️ 终极检测逻辑: 看最大值，而不是第一个值 ---
+        # 找到列里最大的有效数字，用它来定性
+        max_ts = df["unix"].max()
+        
+        if pd.isna(max_ts) or max_ts == 0:
+            print(f"   ⚠️ 警告: {csv_path} 时间列全为空或0！")
+            return pd.DataFrame()
+            
+        # 判定标尺：
+        # 微秒(us) 2024年大约是 1.7e15 (16位数)
+        # 毫秒(ms) 2024年大约是 1.7e12 (13位数)
+        # 秒(s)    2024年大约是 1.7e9  (10位数)
+        
+        if max_ts > 1e14: 
+            unit = 'us' # 微秒
+        elif max_ts > 1e11:
+            unit = 'ms' # 毫秒
+        else:
+            unit = 's'  # 秒
+            
+        # print(f"   ℹ️ 识别时间单位: {unit} (最大值: {max_ts:.0f})") # 调试用
+        df["time"] = pd.to_datetime(df["unix"], unit=unit)
+        
+    elif "date" in df.columns:
+         df["time"] = pd.to_datetime(df["date"])
+    else:
+        print(f"❌ 错误: {csv_path} 没找到时间列! 列名: {df.columns}")
+        return pd.DataFrame() 
+
+    # 4. 设置索引
     df = df.set_index("time").sort_index()
-    #预计算收益率 因为ret的值与ma策略无关
-    df["ret"]=df["close"].pct_change()
+    df = df[df.index > pd.to_datetime("2010-01-01")]
+    # 5. 确保列存在 (兼容 Volume/Vol)
+    required_cols = ["open", "high", "low", "close"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"文件 {csv_path} 缺少列: {col}")
+            
+    if "volume" not in df.columns and "vol" in df.columns:
+        df["volume"] = df["vol"]
+
+    # 6. 计算收益率
+    df["ret"] = df["close"].pct_change().fillna(0)
+    
     return df
 
 # ==== 2. 指标与信号模块 (向量化) ====
@@ -354,7 +406,7 @@ def run_walk_forward(df_raw,short_params,long_params,stop_loss_params,fee,initia
         # B. 在测试集上跑实盘 (Validation)
         # 注意：这里用的是刚刚算出来的 best 参数！
         print(f"   🏃 Running trade in {test_year}...")
-        df_test_sig=calc_ma_signal(df_test,best['s'],best['l'],atr_threshold=0.001)
+        df_test_sig=calc_ma_signal(df_test,int(best['s']),int(best['l']),atr_threshold=0.001)
         #跑回测,初始资金是current_capital(复利滚动)
         curve_test=run_backtest_with_stoploss(df_test_sig,fee,current_capital,stop_loss_pct=best['sl'])
 
@@ -370,90 +422,110 @@ def run_walk_forward(df_raw,short_params,long_params,stop_loss_params,fee,initia
     return final_equity_curve,history_params
 
 # ==========================================
-# 🚀 主程序入口
+# 🚀 Day 17 主程序：多品种验证指挥部 (自动保存版)
 # ==========================================
 if __name__ == "__main__":
-    # 配置区
-    CSV_PATH = "Binance_BTCUSDT_1h.csv"
+    import time
+    import matplotlib.pyplot as plt # 确保导入画图库
+
+    # 1. 定义战场
+    tasks = [
+        {"symbol": "BTC", "file": "Binance_BTCUSDT_1h.csv"},
+        {"symbol": "ETH", "file": "Binance_ETHUSDT_1h.csv"},
+    ]
+    
     INITIAL_CAPITAL = 10000
-    FEE_RATE = 0.0005  # 万五手续费
+    FEE_RATE = 0.0005 
     
-    # 1. 准备数据
-    df = load_price_data(CSV_PATH)
+    # 定义稳健的参数池
+    short_params = [20, 30,50] 
+    long_params = [100, 150, 200, 300]
+    stop_loss_params = [0.05, 0.08, 0.10, 0.15]
     
-    # 2. 定义你要测试的参数池
-    # range(5, 55, 5) 意味着: 5, 10, 15 ... 50
-    short_params = [10, 20,30,50] 
-    long_params = [100,150,200.300]
-    # 🆕 止损参数池: 测 3% 到 15%
-    # 太窄(0.03)容易被打脸，太宽(0.15)扛单太久，看看哪个最好
-    stop_loss_params=[0.05,0.08,0.10,0.15]
-    # # 3. 启动网格搜索
-    # leaderboard = grid_search(df, short_params, long_params,stop_loss_params, FEE_RATE, INITIAL_CAPITAL)
-    # 2. 启动滚动回测
-    start_t=time.time()
-    wfa_curve,wfa_history=run_walk_forward(df,short_params,long_params,stop_loss_params,FEE_RATE,INITIAL_CAPITAL)
-    print(f"\n⏱️ 滚动回测总耗时: {time.time() - start_t:.2f} 秒")
-    # # 4. 展示前 15 名
-    # print("\n🏆 策略排行榜 (Top 15 By Calmar) 🏆")
-    # print(leaderboard.head(15).to_string(formatters={
-    #     'Return': '{:,.2%}'.format,
-    #     'Max_DD': '{:,.2%}'.format,
-    #     'Equity': '{:,.0f}'.format,
-    #     'Sharpe': '{:,.2f}'.format,
-    #     'Calmar': '{:,.2f}'.format
-    # }))
-    # # 5. 画出第一名的曲线
-    # if not leaderboard.empty:
-    #     best_row = leaderboard.iloc[0]
-    #     best_s, best_l = int(best_row["Short"]), int(best_row["Long"])
-    #     best_sl=float(best_row["Stop_Loss"])  
-    #     print(f"\n📈 正在绘制最佳策略: MA {best_s} / {best_l}|Stoploss{best_sl:.1%}")
-    #     # 复现最佳结果（传入best_sl）
-    #     df_best_sig = calc_ma_signal(df, best_s, best_l,atr_threshold=0.001)
-    #     curve_best = run_backtest_with_stoploss(df_best_sig, FEE_RATE, INITIAL_CAPITAL,stop_loss_pct=best_sl)
-    #     # B. 🆕 计算 "买入持有 (Buy & Hold)" 基准曲线
-    #     # 逻辑：资金随价格比例波动。今天的钱 = 初始钱 * (今天价 / 初始价)
-    #     bh_curve=df["close"]/df["close"].iloc[0]*INITIAL_CAPITAL
-    #     bh_return=bh_curve.iloc[-1]/INITIAL_CAPITAL-1        
-    #     plt.figure(figsize=(12, 6))
-    #     # 🆕 画囤币曲线 (灰色虚线，作为背景参考)
-    #     plt.plot(bh_curve, label=f"Buy & Hold Benchmark (Return: {bh_return:.2%})", color='grey', linestyle='--', alpha=0.7)
-    #     plt.plot(curve_best, label=f"Strategy (MA {best_s}/{best_l}, SL {best_sl:.0%})", color='blue', linewidth=1.5)
-    #     plt.title(f"Jarvis vs Benchmark | Calmar: {best_row['Calmar']:.2f} | Max DD: {best_row['Max_DD']:.2%}|Sharpe:{best_row['Sharpe']:.2f}")
-    #     plt.legend()
-    #     plt.grid(True)
-    #     plt.show()
-    # else:
-    #     print("所有策略都亏光了？或者参数设置有误？")
+    final_report = []
+
+    print(f"🚀 Jarvis 量化系统启动 | 初始资金: ${INITIAL_CAPITAL}")
     
-    #3.结果分析
-    if not wfa_curve.empty:
-        #计算最终指标
-        metrics=calculate_metrics(wfa_curve)
-        print("\n🎓 滚动回测 (WFA) 最终成绩单 🎓")
-        print(f"最终资金: {metrics['Final Equity']:,.0f}")
-        print(f"总收益率: {metrics['Total Return']:,.2%}")
-        print(f"最大回撤: {metrics['Max Drawdown']:,.2%}")
-        print(f"卡玛比率: {metrics['Calmar']:.2f}")
-        # 4. 画图
-        # 算个基准 (从回测开始的那一天算起)
-        start_date=wfa_curve.index[0]
-        base_price=df.loc[start_date,"close"]
-        bh_curve=df.loc[start_date:,"close"]/base_price*INITIAL_CAPITAL
-        plt.figure(figsize=(12, 6))
-        plt.plot(wfa_curve, label="Walk-Forward Strategy (Dynamic Params)", color='blue')
-        plt.plot(bh_curve, label="Buy & Hold", color='grey', linestyle='--', alpha=0.5)
-        plt.title(f"Walk-Forward Analysis (2019-2026) | End Capital: {metrics['Final Equity']:,.0f}")
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-        # 5. 打印每年的参数变化 (这很有趣!)
-        print("\n📜 每年最佳参数进化史:")
-        params_df=pd.DataFrame([
-            {"Year":h['year'],"Short":h['params']['s'],"Long":h['params']['l'],"SL":h['params']['sl']}
-            for h in wfa_history
-        ])
-        print(params_df)
+    for task in tasks:
+        symbol = task["symbol"]
+        csv_path = task["file"]
+        
+        print(f"\n{'='*60}")
+        print(f"🔥 正在部署策略进入战场: {symbol} ...")
+        print(f"{'='*60}")
+        
+        # A. 加载数据
+        try:
+            df = load_price_data(csv_path)
+            print(f"   📊 数据加载成功: {len(df)} 行 | 时间: {df.index[0].year} - {df.index[-1].year}")
+        except Exception as e:
+            print(f"   ❌ 错误: 无法加载 {csv_path} ({e})")
+            continue
+            
+        # B. 启动滚动回测
+        # 注意：这里我们确信 run_walk_forward 里面已经加上了 int() 修复
+        wfa_curve, wfa_history = run_walk_forward(df, short_params, long_params, stop_loss_params, FEE_RATE, INITIAL_CAPITAL)
+
+        # C1. 计算囤币曲线 (Buy & Hold)
+        # 逻辑：每一天的钱 = 初始资金 * (今天的价格 / 起始价格)
+        # 注意：要和 wfa_curve 的时间段对齐
+        if not wfa_curve.empty:
+            start_date=wfa_curve.index[0]
+            #截取同时间段的价格数据
+            mask=df.index>=start_date
+            # 归一化计算：让囤币曲线也从 10000 开始
+            buy_hold_curve=df.loc[mask,"close"]/df.loc[mask,"close"].iloc[0]*INITIAL_CAPITAL
+            # 为了画图好看，把 buy_hold_curve 重新采样到和 wfa_curve 一样的点数 (虽然本来就差不多)
+            buy_hold_curve = buy_hold_curve.reindex(wfa_curve.index, method='ffill')
+
+        # C2. 记录战果
+        if not wfa_curve.empty:
+            metrics = calculate_metrics(wfa_curve)
+            metrics["Symbol"] = symbol 
+            #顺便计算囤币曲线的最终收益，方便对比
+            bh_return=buy_hold_curve.iloc[-1]/INITIAL_CAPITAL-1
+
+            metrics["Buy&Hold Ret"]=bh_return
+
+            final_report.append(metrics)
+            # 🖼️ 核心修改：画图并保存，而不是弹窗
+            plt.figure(figsize=(12, 6))
+            #绘制策略线
+            plt.plot(wfa_curve.index, wfa_curve.values, label=f"Jarvis Strategy (Final: ${wfa_curve.iloc[-1]:,.0f})", color='blue', linewidth=1.5)
+            # 2. 画囤币线 (灰色，虚线，透明一点)
+            plt.plot(buy_hold_curve.index, buy_hold_curve.values, label=f"Buy & Hold (Final: ${buy_hold_curve.iloc[-1]:,.0f})", color='grey', linestyle='--', alpha=0.6)
+            # 如果你想画基准(Buy & Hold)，需要先计算 df['close'] 的净值
+            # 简单起见，这里先只画策略曲线
+            plt.title(f"{symbol} Walk-Forward Strategy vs Buy & Hold ({start_date.year}-{wfa_curve.index[-1].year})")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            
+            # 💾 保存图片!
+            img_name = f"{symbol}_comparison.png"
+            plt.savefig(img_name)
+            print(f"   📸 战报曲线已保存为: {img_name}")
+            plt.close() # 关掉画布，释放内存，防止卡顿
+        else:
+            print(f"   ⚠️ {symbol} 回测失败。")
+    # 4. 汇总大比拼
+    if final_report:
+        print("\n\n" + "="*80)
+        print("🏆 多品种实战总榜单 (Multi-Asset Report) 🏆")
+        print("="*80)
+        df_report = pd.DataFrame(final_report)
+        
+        cols = ["Symbol", "Total Return", "Max Drawdown", "Sharpe", "Calmar", "Final Equity"]
+        # 容错处理，只取存在的列
+        cols = [c for c in cols if c in df_report.columns]
+        df_report = df_report[cols]
+        
+        print(df_report.to_string(formatters={
+            'Total Return': '{:,.2%}'.format,
+            'Max Drawdown': '{:,.2%}'.format,
+            'Sharpe': '{:,.2f}'.format,
+            'Calmar': '{:,.2f}'.format,
+            'Final Equity': '{:,.0f}'.format
+        }))
+        print("="*80)
     else:
-        print("❌ 回测生成失败")
+        print("\n❌ 没有数据生成。")
