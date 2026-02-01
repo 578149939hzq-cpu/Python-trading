@@ -3,120 +3,114 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
-# 1. 第一步：先导入 config 模块
 import config
 
 # ==========================================
-# 🚑 紧急热修复 (Hotfix) - 适配层 (保持不变)
+# 🛠️ 适配层 (保持之前的热修复逻辑)
 # ==========================================
-# ⚠️ 注意：这段代码必须在 "from jarvis_engine.alpha" 之前执行！
-
-# --- 修复 A: 强行纠正路径错误 ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-# 修正读取路径
-REAL_DATA_PATH = os.path.join(PROJECT_ROOT, "data_raw", "Binance_BTCUSDT_1h.csv")
-config.DATA_PATH = REAL_DATA_PATH 
+# 自动寻找 data_raw
+DATA_PATH_GUESS = os.path.join(PROJECT_ROOT, "data_raw", "Binance_BTCUSDT_1h.csv")
+if os.path.exists(DATA_PATH_GUESS):
+    config.DATA_PATH = DATA_PATH_GUESS
 
-# --- 修复 B: 伪造 Config 类 ---
 class ConfigAdapter:
-    VOL_LOOKBACK = config.VOLATILITY_SPAN 
+    VOL_LOOKBACK = getattr(config, 'VOLATILITY_SPAN', 36)
     STRATEGY_PARAMS = config.STRATEGY_PARAMS
     WEIGHTS = config.WEIGHTS
-    TARGET_VOLATILITY=config.TARGET_VOLATILITY
-    MAX_LEVERAGE=config.MAX_LEVERAGE
+    DATA_PATH = config.DATA_PATH
+    # 新增风控参数透传
+    TARGET_VOLATILITY = getattr(config, 'TARGET_VOLATILITY', 0.20)
+    MAX_LEVERAGE = getattr(config, 'MAX_LEVERAGE', 4.0)
+
 config.Config = ConfigAdapter
 
-# ==========================================
-# 🛑 补丁打完后，再导入 alpha 模块
-# ==========================================
-from jarvis_engine.alpha import load_price_data
-from jarvis_engine.alpha import calculate_scaled_forecast
-from jarvis_engine.alpha import calculate_position_target
-from jarvis_engine.alpha import run_vectorized_backtest
+from jarvis_engine.alpha import load_price_data, calculate_scaled_forecast
+from jarvis_engine.alpha import calculate_position_target, run_vectorized_backtest
 
+# ==========================================
+# 📊 新增：风险诊断绘图引擎
+# ==========================================
+def plot_leverage_diagnostic(df_res):
+    print("🏥 正在生成风险诊断报告 (Leverage Diagnostic)...")
+    
+    # 准备画布：3行1列
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    
+    # 子图 1: 价格走势
+    ax1 = axes[0]
+    ax1.plot(df_res.index, df_res['close'], color='black', alpha=0.6)
+    ax1.set_title(f"BTC Price Action", fontweight='bold')
+    ax1.set_ylabel("Price ($)")
+    ax1.grid(True, alpha=0.2)
+    
+    # 子图 2: 波动率 (Vol) vs 目标 (Target)
+    ax2 = axes[1]
+    # 绘制实际波动率
+    ax2.plot(df_res.index, df_res['ann_vol_pct'], color='blue', linewidth=1.5, label='Actual Vol (Ann.)')
+    # 绘制目标波动率红线
+    target_vol = ConfigAdapter.TARGET_VOLATILITY
+    ax2.axhline(target_vol, color='red', linestyle='--', linewidth=2, label=f'Target Vol ({target_vol})')
+    
+    ax2.set_title("Market Volatility vs Target", fontweight='bold')
+    ax2.set_ylabel("Annualized Volatility")
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.2)
+    
+    # 子图 3: 动态杠杆 (Leverage)
+    ax3 = axes[2]
+    ax3.plot(df_res.index, df_res['leverage_ratio'], color='green', linewidth=1.5, label='Dynamic Leverage')
+    
+    # 标记被强制封顶 (Clipped) 的区域
+    max_lev = ConfigAdapter.MAX_LEVERAGE
+    ax3.axhline(max_lev, color='red', linestyle=':', label=f'Max Cap ({max_lev}x)')
+    
+    # 填充因为波动率过低而触顶的区域
+    ax3.fill_between(df_res.index, df_res['leverage_ratio'], max_lev, 
+                     where=(df_res['leverage_ratio'] >= max_lev), 
+                     color='red', alpha=0.3, label='Clipped Region')
+
+    ax3.set_title("System Leverage Ratio", fontweight='bold')
+    ax3.set_ylabel("Leverage (x)")
+    ax3.legend(loc='upper right')
+    ax3.grid(True, alpha=0.2)
+    
+    plt.tight_layout()
+    
+    # 保存
+    results_dir = os.path.join(PROJECT_ROOT, "data_results")
+    if not os.path.exists(results_dir): os.makedirs(results_dir)
+    save_path = os.path.join(results_dir, "Leverage_Diagnostic.png")
+    
+    plt.savefig(save_path, dpi=300)
+    print(f"✅ 诊断报告已保存: {save_path}")
+    plt.show()
+
+# ==========================================
+# 🚀 主任务流程
+# ==========================================
 def mission_start():
     print("🚀 Jarvis System Initializing...")
-    
-    # 1. 加载数据
-    print(f"📂 Loading data from: {config.DATA_PATH}")
     df = load_price_data(config.DATA_PATH)
     
-    if df.empty:
-        print("❌ 数据加载失败，请检查 data_raw 文件夹。")
-        return
+    if df.empty: return
 
-    # 2. 计算 Alpha (大脑)
-    print("🧠 Calculating Alpha (EWMAC)...")
+    print("🧠 Calculating Alpha...")
     df = calculate_scaled_forecast(df)
     
-    # 3. 计算 仓位 (手脚)
-    print(f"🛡️ Adjusting Positions (Buffer={config.POSITION_BUFFER})...")
+    print(f"🛡️ Risk Engine: Vol-Targeting (Target={ConfigAdapter.TARGET_VOLATILITY}, Max={ConfigAdapter.MAX_LEVERAGE}x)...")
     df = calculate_position_target(df, buffer=config.POSITION_BUFFER)
     
-    # 4. 回测 (模拟场)
-    print("⚡ Running Vectorized Backtest...")
-    df_result = run_vectorized_backtest(df, fee_rate=config.FEE_RATE)
+    print("⚡ Backtesting...")
+    df_res = run_vectorized_backtest(df, fee_rate=config.FEE_RATE)
     
-    # 5. 战报展示
-    if 'equity' not in df_result.columns:
-        print("❌ 回测未能生成净值曲线。")
-        return
-
-    final_equity = df_result['equity'].iloc[-1]
-    total_return = (final_equity - 1) * 100
+    # 打印简报
+    final_equity = df_res['equity'].iloc[-1]
+    sharpe = (df_res['net_log_ret'].mean() / df_res['net_log_ret'].std()) * np.sqrt(365*24)
+    print(f"🏆 最终净值: {final_equity:.4f} | 夏普比率: {sharpe:.2f}")
     
-    net_ret = df_result['net_log_ret']
-    std = net_ret.std()
-    sharpe = (net_ret.mean() / std) * np.sqrt(365 * 24) if std != 0 else 0
-
-    print("-" * 40)
-    print(f"🏆 最终战报 (Final Report)")
-    print(f"💰 最终净值: {final_equity:.4f}")
-    print(f"📈 总回报率: {total_return:.2f}%")
-    print(f"📊 夏普比率: {sharpe:.2f}")
-    print("-" * 40)
-    
-    # ==========================================
-    # 📸 6. 画图并保存 (升级部分)
-    # ==========================================
-    
-    # A. 准备文件夹
-    # 在项目根目录下，找一个叫 data_results 的文件夹
-    results_dir = os.path.join(PROJECT_ROOT, "data_results")
-    
-    # 如果文件夹不存在，就自动创建一个 (os.makedirs 会帮你搞定)
-    if not os.path.exists(results_dir):
-        os.makedirs(results_dir)
-        print(f"📁 已自动创建结果文件夹: {results_dir}")
-        
-    # B. 设置图片文件名
-    # 我们可以加上夏普比率在文件名里，方便以后对比
-    file_name = f"Backtest_Result_Sharpe_{sharpe:.2f}.png"
-    save_path = os.path.join(results_dir, file_name)
-
-    # C. 开始画图
-    plt.figure(figsize=(12, 6))
-    
-    # 画 Buy & Hold (基准)
-    plt.plot(df_result.index, df_result['buy_hold_equity'], 
-             label='Buy & Hold (BTC)', color='gray', linestyle='--', alpha=0.5)
-    
-    # 画 Jarvis 策略
-    plt.plot(df_result.index, df_result['equity'], 
-             label='Jarvis Strategy', color='#FF9900', linewidth=2)
-    
-    plt.title(f'Jarvis Strategy Equity Curve (Sharpe: {sharpe:.2f})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # D. 保存图片 (关键一步!)
-    # dpi=300 代表高清大图
-    plt.savefig(save_path, dpi=300)
-    print(f"✅ 图片已保存至: {save_path}")
-    
-    # E. 最后再弹窗显示
-    plt.show()
+    # 🔥 调用诊断函数
+    plot_leverage_diagnostic(df_res)
 
 if __name__ == "__main__":
     mission_start()
