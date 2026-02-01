@@ -23,7 +23,8 @@ class ConfigAdapter:
     VOL_LOOKBACK = config.VOLATILITY_SPAN 
     STRATEGY_PARAMS = config.STRATEGY_PARAMS
     WEIGHTS = config.WEIGHTS
-
+    TARGET_VOLATILITY=config.TARGET_VOLATILITY
+    MAX_LEVERAGE=config.MAX_LEVERAGE
 config.Config = ConfigAdapter
 
 # ==========================================

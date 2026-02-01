@@ -124,6 +124,7 @@ def calculate_scaled_forecast(df: pd.DataFrame) -> pd.DataFrame:
 
 # ... (run_vectorized_backtest 和 calculate_position_target 保持不变) ...
 def run_vectorized_backtest(df:pd.DataFrame,fee_rate=0.0005)->pd.DataFrame:
+
     # 保持原样
     data=df.copy()
     data["market_log_ret"]=np.log(data['close']).diff().fillna(0)
@@ -135,28 +136,83 @@ def run_vectorized_backtest(df:pd.DataFrame,fee_rate=0.0005)->pd.DataFrame:
     data['buy_hold_equity']=np.exp(data['market_log_ret'].cumsum())
     return data
 
-def calculate_position_target(df:pd.DataFrame,forecast_col='forecast',buffer=0.1)->pd.DataFrame:
-    # 保持原样 (这个函数非常经典，不需要改)
-    data=df.copy()
-    # 1. 映射: -20/+20 -> -1.0/+1.0 (满仓)
-    # 这一步已经隐含了 Volatility Targeting 的部分逻辑(满仓限制)
-    # 后续 Phase 4 我们会在这里引入更严格的 Target Risk 计算
-    ideal_position=data[forecast_col]/20.0 # 注意：这里如果 forecast 满格是20，除以20归一化
-    ideal_position=ideal_position.clip(lower=-1.0,upper=1.0)
+def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=0.1) -> pd.DataFrame:
+    """
+    Day 23.5 Upgrade: 引入动态波动率缩放 (Vol-Scaling)
+    逻辑：
+    1. 计算当前价格的年化波动率。
+    2. 计算杠杆系数 = 目标波动率 / 当前波动率。
+    3. 动态调整仓位。
+    """
+    data = df.copy()
+    
+    # -------------------------------------------------------
+    # 1. 计算年化波动率百分比 (Annualized Volatility %)
+    # -------------------------------------------------------
+    # data['volatility'] 是小时级别的绝对价格波动 (std)
+    # 我们需要把它转化为：相对于当前价格的、年化的百分比
+    # 公式：(Vol / Price) * sqrt(24小时 * 365天)
+    
+    # 安全检查：防止除以0
+    close_price = data['close'].replace(0, np.nan)
+    hourly_vol_pct = data['volatility'] / close_price
+    
+    # 年化因子 (根号下 8760 小时)
+    sqrt_time = np.sqrt(24 * 365)
+    
+    data['ann_vol_pct'] = hourly_vol_pct * sqrt_time
+    # 填补空值 (防止开局数据不足导致的空值)
+    data['ann_vol_pct'] = data['ann_vol_pct'].fillna(method='ffill').fillna(0)
 
-    ideal_values=ideal_position.values
-    n=len(ideal_values)
-    buffered_position=np.zeros(n)
-    current_pos=0.0
+    # -------------------------------------------------------
+    # 2. 计算动态杠杆 (Leverage Ratio)
+    # -------------------------------------------------------
+    # 目标：保持组合的年化波动率恒定在 Config.TARGET_VOLATILITY (比如 20%)
+    # 如果当前波动率是 10%，我们就上 2.0x 杠杆
+    # 如果当前波动率是 40%，我们就降到 0.5x 仓位
+    
+    # 防除零处理 (加一个极小值 1e-6)
+    vol_safe = data['ann_vol_pct'].replace(0, 1e-6)
+    
+    leverage_ratio = Config.TARGET_VOLATILITY / vol_safe
+    
+    # -------------------------------------------------------
+    # 3. 计算目标仓位 (Ideal Position)
+    # -------------------------------------------------------
+    # 原始信号强度 (-20 ~ +20) 归一化到 (-1 ~ +1)
+    raw_signal_strength = data[forecast_col] / 20.0
+    
+    # 叠加波动率杠杆
+    ideal_position = raw_signal_strength * leverage_ratio
+    
+    # -------------------------------------------------------
+    # 4. 风控熔断 (Risk Cap)
+    # -------------------------------------------------------
+    # 无论模型多有信心，绝对不能超过最大允许杠杆 (比如 4倍)
+    limit = Config.MAX_LEVERAGE
+    ideal_position = ideal_position.clip(-limit, limit)
+    
+    # -------------------------------------------------------
+    # 5. 缓冲器逻辑 (Buffer) - 保持 Day 20 的逻辑不变
+    # -------------------------------------------------------
+    ideal_values = ideal_position.values
+    n = len(ideal_values)
+    buffered_position = np.zeros(n)
+    current_pos = 0.0
 
     for i in range(n):
-        ideal=ideal_values[i]
-        if abs(ideal-current_pos)>buffer:
-            current_pos=ideal
-        else: current_pos = current_pos
-        buffered_position[i]=current_pos
+        ideal = ideal_values[i]
+        # 只有当新目标和当前持仓的差距超过 buffer 时，才调仓
+        if abs(ideal - current_pos) > buffer:
+            current_pos = ideal
         
-    data['raw_target']=ideal_position 
-    data['buffered_pos']=buffered_position 
-    data['position']=data['buffered_pos'].shift(1).fillna(0)
+        buffered_position[i] = current_pos
+        
+    data['raw_target'] = ideal_position 
+    data['buffered_pos'] = buffered_position 
+    
+    # Shift(1) 代表“下根K线执行”，防止未来函数
+    data['position'] = data['buffered_pos'].shift(1).fillna(0)
+    
     return data
+  

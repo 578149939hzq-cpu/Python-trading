@@ -52,9 +52,8 @@ DEFAULT_SCALAR = 10.0
 # 防止在震荡市被手续费磨损
 POSITION_BUFFER = 0.10  # 10%
 
-# 单次最大持仓限制 (Risk Management)
-# 1.0 = 100% (不加杠杆)
-MAX_LEVERAGE = 1.0
+
+
 
 # ==========================================
 # 4. 回测环境配置 (Simulation)
@@ -63,6 +62,9 @@ MAX_LEVERAGE = 1.0
 INITIAL_CAPITAL = 10000.0
 TARGET_VOLATILITY = 0.80   # 年化波动率目标 (20% is Carver's standard)
 IDM = 1.0                  # 暂时设为 1.0 (单一资产)
+# 最大杠杆限制 (硬顶)
+# 防止波动率极低时算出一个 100倍杠杆把账户爆了
+MAX_LEVERAGE=4.0
 # 交易手续费率
 # Binance 现货通常是 0.1% (0.001)，BNB 抵扣是 0.075% (0.00075)
 # 量化通常设得高一点作为滑点保护，比如 万五 (0.0005)
