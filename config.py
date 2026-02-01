@@ -34,7 +34,6 @@ STRATEGY_PARAMS = {
 # 我们认为这4个策略一样好，所以权重平均
 WEIGHTS = [0.25, 0.25, 0.25, 0.25]
 # 波动率计算周期 (用于归一化)
-# 通常用 36 (约等于 EWM 版的 20日均线)
 VOLATILITY_SPAN = 36
 
 # 预测值放大系数 (Scalar)
@@ -51,16 +50,12 @@ DEFAULT_SCALAR = 10.0
 # 只有当 (目标仓位 - 当前仓位) 的绝对值大于此值时，才调仓
 # 防止在震荡市被手续费磨损
 POSITION_BUFFER = 0.10  # 10%
-
-
-
-
 # ==========================================
 # 4. 回测环境配置 (Simulation)
 # ==========================================
 # 初始资金 (美元)
 INITIAL_CAPITAL = 10000.0
-TARGET_VOLATILITY = 0.80   # 年化波动率目标 (20% is Carver's standard)
+TARGET_VOLATILITY = 1.00  # 年化波动率目标 (20% is Carver's standard)
 IDM = 1.0                  # 暂时设为 1.0 (单一资产)
 # 最大杠杆限制 (硬顶)
 # 防止波动率极低时算出一个 100倍杠杆把账户爆了
@@ -75,3 +70,6 @@ FEE_RATE = 0.0005
 START_DATE = '2020-01-01'
 SPLIT_DATE = '2023-01-01' # 之前是 IS，之后是 OOS
 END_DATE = '2026-01-01'
+# [V2.0 Update] Sigma 熔断阈值
+# 如果单小时涨跌幅超过 3倍标准差，视为流动性黑洞，强制清零
+SIGMA_THRESHOLD = 4.0

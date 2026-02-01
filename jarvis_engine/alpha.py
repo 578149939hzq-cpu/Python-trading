@@ -138,69 +138,92 @@ def run_vectorized_backtest(df:pd.DataFrame,fee_rate=0.0005)->pd.DataFrame:
 
 def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=0.1) -> pd.DataFrame:
     """
-    [Day 23.5 Upgrade + Diagnostic] 
-    计算动态波动率缩放，并保留诊断数据 (leverage_ratio, ann_vol_pct)
+    [Risk Engine V2.0]
+    1. 统一波动率计算 (Return Volatility)
+    2. 动态杠杆 (Vol-Targeting)
+    3. Sigma 熔断 (Safety Airbag)
     """
-    from config import Config # 延迟导入，适配 main.py 的热补丁
-    
+    # 局部引入 Config，确保能读取到 main.py 中注入的最新参数
+    from config import Config
+
     data = df.copy()
-    
-    # -------------------------------------------------------
-    # 1. 计算年化波动率 (Diagnostic Data 1)
-    # -------------------------------------------------------
-    # 转化为年化百分比: (std / price) * sqrt(24*365)
-    close_safe = data['close'].replace(0, np.nan)
-    hourly_vol_pct = data['volatility'] / close_safe
-    
-    # 根号下 8760 小时
-    sqrt_time = np.sqrt(24 * 365)
-    
-    # 保存这一列，供 main.py 画图诊断
-    data['ann_vol_pct'] = (hourly_vol_pct * sqrt_time).fillna(0)
 
-    # -------------------------------------------------------
-    # 2. 计算动态杠杆 (Diagnostic Data 2)
-    # -------------------------------------------------------
-    # 目标：Target Vol / Current Vol
-    vol_safe = data['ann_vol_pct'].replace(0, 1e-6)
-    
-    raw_leverage = Config.TARGET_VOLATILITY / vol_safe
-    
-    # 封顶处理
-    capped_leverage = raw_leverage.clip(upper=Config.MAX_LEVERAGE)
-    
-    # ⚠️ 关键：保存杠杆率，供诊断分析
-    data['leverage_ratio'] = capped_leverage
-    
-    # -------------------------------------------------------
-    # 3. 计算目标仓位
-    # -------------------------------------------------------
-    # 原始信号 (-1 ~ 1)
-    raw_signal = data[forecast_col] / 20.0
-    
-    # 最终公式：信号 * 动态杠杆
-    ideal_position = raw_signal * capped_leverage
-    
-    # 硬性截断 (防止数值爆炸)
-    ideal_position = ideal_position.clip(-Config.MAX_LEVERAGE, Config.MAX_LEVERAGE)
+    # ==========================================
+    # 1. 统一波动率计算 (The Right Way)
+    # ==========================================
+    # 直接计算"收益率"的波动率，而非价格的标准差
+    hourly_ret = data['close'].pct_change().fillna(0)
 
-    # -------------------------------------------------------
-    # 4. 缓冲器 (Buffer)
-    # -------------------------------------------------------
-    ideal_values = ideal_position.values
+    # 使用 config 中的长周期 (默认168=一周) 计算稳健波动率
+    # 注意：这里得到的是"小时级标准差" (Hourly Sigma)
+    hourly_sigma = hourly_ret.ewm(span=Config.VOL_LOOKBACK).std().fillna(0)
+
+    # 转化为年化波动率 (用于计算杠杆)
+    # Annual Vol = Hourly Sigma * sqrt(8760)
+    data['ann_vol_pct'] = hourly_sigma * np.sqrt(365 * 24)
+
+    # ==========================================
+    # 2. 计算动态杠杆 (Dynamic Leverage)
+    # ==========================================
+    # 避免除以零
+    safe_vol = data['ann_vol_pct'].replace(0, 1e-6)
+
+    # 公式：目标波动率 / 当前波动率
+    # 如果目标是20%，当前波动率是10%，则上2倍杠杆
+    leverage_ratio = Config.TARGET_VOLATILITY / safe_vol
+
+    # 封顶：不超过最大允许杠杆 (例如 2.0x)
+    leverage_ratio = leverage_ratio.clip(upper=Config.MAX_LEVERAGE)
+    data['leverage_ratio'] = leverage_ratio
+
+    # ==========================================
+    # 3. 基础目标仓位
+    # ==========================================
+    # 归一化预测值 (-1 ~ 1)
+    raw_position = data[forecast_col] / 20.0
+
+    # 叠加杠杆
+    ideal_position = raw_position * leverage_ratio
+
+    # ==========================================
+    # 4. Sigma 熔断机制 (Safety Airbag) !!!
+    # ==========================================
+    # 计算当前的容忍上限：N倍标准差
+    # 如果当前这一小时跌幅超过了 3倍的历史平均波动，说明市场流动性枯竭
+    sigma_limit = hourly_sigma * Config.SIGMA_THRESHOLD
+
+    # 标记熔断时刻
+    # abs(hourly_ret) 代表无论暴涨还是暴跌，只要剧烈波动就熔断
+    meltdown_mask = abs(hourly_ret) > sigma_limit
+
+    # 记录熔断事件 (供诊断绘图用)
+    data['sigma_event'] = meltdown_mask
+
+    # ⚡️ 强制清仓
+    # 在熔断时刻，将目标仓位强行设为 0
+    ideal_position = np.where(meltdown_mask, 0.0, ideal_position)
+
+    # 再次截断最终仓位 (防止逻辑漏洞)
+    ideal_position = np.clip(ideal_position, -Config.MAX_LEVERAGE, Config.MAX_LEVERAGE)
+
+    # ==========================================
+    # 5. 缓冲器 (Buffer)
+    # ==========================================
+    ideal_values = ideal_position
     n = len(ideal_values)
     buffered_position = np.zeros(n)
     current_pos = 0.0
 
     for i in range(n):
         ideal = ideal_values[i]
+        # 只有当新目标和当前持仓的差距超过 buffer 时，才调仓
         if abs(ideal - current_pos) > buffer:
             current_pos = ideal
         buffered_position[i] = current_pos
-        
-    data['raw_target'] = ideal_position 
-    data['buffered_pos'] = buffered_position 
+
+    data['raw_target'] = ideal_position
+    data['buffered_pos'] = buffered_position
+    # Shift(1) 代表“下根K线执行”，防止未来函数
     data['position'] = data['buffered_pos'].shift(1).fillna(0)
-    
+
     return data
-  
