@@ -26,32 +26,29 @@ def plot_full_report(df_res):
     ax0.plot(df_res.index, df_res['equity'], color='#FF9900', linewidth=2, label='Jarvis Strategy')
     ax0.plot(df_res.index, df_res['buy_hold_equity'], color='gray', linestyle='--', alpha=0.6, label='Buy & Hold')
     ax0.set_title("🏆 Equity Curve (Net of Fees)", fontweight='bold', fontsize=14)
-    ax0.set_ylabel("Normalized Equity ($)")
+    ax0.set_ylabel("Account Value ($)")
     ax0.legend(loc='upper left')
     
     # --- 子图 2: 价格与风控事件 ---
     ax1 = axes[1]
     ax1.plot(df_res.index, df_res['close'], color='black', alpha=0.6, linewidth=1, label='Price')
     
-    # 标记熔断 (红色倒三角)
+    # 标记熔断 (红色倒三角) - V3.2 只有 ATR Closing Stop
     meltdowns = df_res[df_res.get('is_meltdown', False) == True]
     if not meltdowns.empty:
-        ax1.scatter(meltdowns.index, meltdowns['close'], color='red', marker='v', s=30, zorder=5, label='Meltdown (Crash Protection)')
+        ax1.scatter(meltdowns.index, meltdowns['close'], color='red', marker='v', s=40, zorder=5, label=f'ATR Stop (> {Config.ATR_MULTIPLIER}x)')
         
-    # 标记瞬时止损 (紫色X)
-    stops = df_res[df_res.get('is_stop_loss', False) == True]
-    if not stops.empty:
-        ax1.scatter(stops.index, stops['close'], color='purple', marker='x', s=20, zorder=4, label='Intraday Stop (Fat-Tail)')
+    # V3.2 已移除瞬时止损，此处不再绘制紫色X
 
-    ax1.set_title(f"📉 Price Action & Risk Events (Metric: {Config.RISK_METRIC})", fontweight='bold', fontsize=14)
+    ax1.set_title(f"📉 Price Action & Wide ATR Risk Control ({Config.ATR_MULTIPLIER}x)", fontweight='bold', fontsize=14)
     ax1.legend(loc='upper left')
 
     # --- 子图 3: 波动率监测 ---
     ax2 = axes[2]
-    # 这里画的是 "Equivalent Sigma" (转换后的等效波动率)
-    ax2.plot(df_res.index, df_res['ann_vol_pct'], color='blue', linewidth=1.5, label=f'Robust Vol ({Config.RISK_METRIC} Equiv.)')
+    # 显示长期波动率
+    ax2.plot(df_res.index, df_res['ann_vol_pct'], color='blue', linewidth=1.5, label=f'Long-Term Vol (Span={Config.VOL_LOOKBACK})')
     ax2.axhline(Config.TARGET_VOLATILITY, color='green', linestyle='--', linewidth=2, label=f'Target ({Config.TARGET_VOLATILITY})')
-    ax2.set_title("🌊 Volatility Regime", fontweight='bold', fontsize=14)
+    ax2.set_title("🌊 Volatility Regime (Stable Sizing)", fontweight='bold', fontsize=14)
     ax2.set_ylabel("Annualized Vol %")
     ax2.legend(loc='upper left')
 
@@ -83,18 +80,17 @@ def plot_full_report(df_res):
 # ==========================================
 def plot_crash_snapshots(df_res, top_n=3):
     """
-    自动寻找波动率最大的前 N 个风险时刻，生成局部特写图
+    自动寻找风险事件时刻，生成局部特写图
     """
     print(f"📸 Generating Top {top_n} Crash Snapshots...")
     
     risk_events = df_res[df_res.get('sigma_event', False) == True].copy()
     
     if risk_events.empty:
-        print("🎉 Good News: No risk events triggered. No snapshots needed.")
+        print("🎉 Good News: No risk events triggered (System is extremely robust).")
         return
 
-    # 按“稳健波动率”从大到小排序
-    # 注意：V3.0 里我们参考 vol_equiv_sigma 或 ann_vol_pct
+    # 按波动率排序
     risk_events = risk_events.sort_values('ann_vol_pct', ascending=False)
     
     risk_events['date'] = risk_events.index.date
@@ -103,8 +99,8 @@ def plot_crash_snapshots(df_res, top_n=3):
     results_dir = os.path.join(Config.BASE_DIR, "data_results")
 
     for idx, (timestamp, row) in enumerate(top_days.iterrows()):
-        start_t = timestamp - pd.Timedelta(days=3)
-        end_t = timestamp + pd.Timedelta(days=3)
+        start_t = timestamp - pd.Timedelta(days=5) # 稍微拉长一点观察周期，看趋势
+        end_t = timestamp + pd.Timedelta(days=5)
         subset = df_res.loc[start_t:end_t]
         
         if subset.empty: continue
@@ -112,17 +108,14 @@ def plot_crash_snapshots(df_res, top_n=3):
         fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
         
         date_str = timestamp.strftime('%Y-%m-%d')
-        fig.suptitle(f"🚨 Crash Forensics: {date_str} (Robust Vol: {row['ann_vol_pct']:.1%})", fontsize=16, fontweight='bold', color='darkred')
+        fig.suptitle(f"🚨 Risk Event: {date_str} (Vol: {row['ann_vol_pct']:.1%})", fontsize=16, fontweight='bold', color='darkred')
         
         # 图1
         ax0 = axes[0]
         ax0.plot(subset.index, subset['close'], color='black', label='Price')
         
         local_melt = subset[subset.get('is_meltdown', False) == True]
-        ax0.scatter(local_melt.index, local_melt['close'], color='red', marker='v', s=100, label='Meltdown')
-        
-        local_stop = subset[subset.get('is_stop_loss', False) == True]
-        ax0.scatter(local_stop.index, local_stop['close'], color='purple', marker='x', s=80, label='Intraday Stop')
+        ax0.scatter(local_melt.index, local_melt['close'], color='red', marker='v', s=100, label='ATR Stop')
         
         ax0.set_title("Price Action", fontsize=10)
         ax0.legend()
@@ -138,12 +131,12 @@ def plot_crash_snapshots(df_res, top_n=3):
         
         # 图3
         ax2 = axes[2]
-        ax2.plot(subset.index, subset['ann_vol_pct'], color='blue', label='Robust Vol')
+        ax2.plot(subset.index, subset['ann_vol_pct'], color='blue', label='Long-Term Vol')
         ax2.axhline(Config.TARGET_VOLATILITY, color='green', linestyle='--', label='Target')
-        ax2.set_title("Volatility Spike", fontsize=10)
+        ax2.set_title("Volatility", fontsize=10)
         ax2.grid(True, alpha=0.3)
         
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:00'))
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
         plt.xticks(rotation=45)
         
         fname = f"Snapshot_{idx+1}_{date_str}.png"
@@ -157,7 +150,7 @@ def plot_crash_snapshots(df_res, top_n=3):
 # 🚀 主任务
 # ==========================================
 def mission_start():
-    print("🚀 Jarvis System Initializing (Risk Engine V3.0 Robust Edition)...")
+    print("🚀 Jarvis System Initializing (Risk Engine V3.2 Simplified)...")
     
     # 强制重载配置
     import importlib
@@ -171,22 +164,20 @@ def mission_start():
         print("❌ Data not found.")
         return
 
-    print("🧠 Calculating Alpha...")
+    print("🧠 Calculating Alpha (Raw Signal)...")
     df = calculate_scaled_forecast(df)
     
-    # 打印正确的新版参数 (MAD / Multiplier)
-    print(f"🛡️ Risk Engine V3.0 (Metric={Config.RISK_METRIC}, Multiplier={Config.STOP_LOSS_MULTIPLIER}x)...")
+    print(f"🛡️ Risk Engine V3.2 (Metric=ATR, Multiplier={Config.ATR_MULTIPLIER}x, VolSpan={Config.VOL_LOOKBACK})...")
     
-    # 这里依然只需要传 buffer，因为 V3.0 的风控参数(metric, window等)已经通过 Config 类内部读取了
     df = calculate_position_target(df, buffer=Config.POSITION_BUFFER)
     
-    print("⚡ Backtesting (Gap Corrected)...")
+    print("⚡ Backtesting (Closing Basis)...")
     df_res = run_vectorized_backtest(df, fee_rate=Config.FEE_RATE)
     
     final = df_res['equity'].iloc[-1]
     sharpe = (df_res['net_log_ret'].mean() / df_res['net_log_ret'].std()) * np.sqrt(365*24)
     print("-" * 40)
-    print(f"🏆 Final Equity: {final:.4f}")
+    print(f"🏆 Final Equity: ${final:,.2f} (Initial: ${Config.INITIAL_CAPITAL})")
     print(f"📊 Sharpe Ratio: {sharpe:.2f}")
     print("-" * 40)
     
