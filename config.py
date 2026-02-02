@@ -1,76 +1,48 @@
 import os
 
-# ==========================================
-# 1. 基础设施配置 (Infrastructure)
-# ==========================================
-# 项目根目录 (自动获取当前文件所在目录)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+class Config:
+    # ==========================================
+    # 1. 基础设施 (Infrastructure)
+    # ==========================================
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    # 自动识别：优先找 data_raw (你的实际文件夹)，找不到再找 data/raw
+    if os.path.exists(os.path.join(BASE_DIR, "data_raw")):
+        DATA_PATH = os.path.join(BASE_DIR, "data_raw", "Binance_BTCUSDT_1h.csv")
+    else:
+        DATA_PATH = os.path.join(BASE_DIR, "data", "raw", "Binance_BTCUSDT_1h.csv")
 
-# 数据存储路径
-# ✅ 正确写法 (找 data_raw)
-DATA_RAW_DIR = os.path.join(BASE_DIR, "data_raw")
-DATA_PROCESSED_DIR = os.path.join(BASE_DIR, "data_processed")
-# 默认交易对文件
-DEFAULT_SYMBOL = "BTCUSDT"
-DATA_FILE_NAME = "Binance_BTCUSDT_1h.csv"
-DATA_PATH = os.path.join(DATA_RAW_DIR, DATA_FILE_NAME)
-# ==========================================
-# 2. Alpha 核心参数 (Brain Parameters)
-# ==========================================
-# 这里的参数决定了 Jarvis 怎么看待市场
-# Robert Carver 的 EWMA 周期组合
-# 这里的数字代表 "Span" (指数衰减跨度)，不是简单的 Window
-# 8=极快, 64=长期趋势
-STRATEGY_PARAMS = {
+    # ==========================================
+    # 2. 策略参数 (Alpha Params)
+    # ==========================================
+    STRATEGY_PARAMS = {
         'fast_span': [8, 16, 32, 64],
         'slow_span': [32, 64, 128, 256],
-        # 对应上面四组的缩放系数
-        'scalars': [5.6, 3.8, 2.6, 1.9] 
+        'scalars': [5.6, 3.8, 2.6, 1.9]
     }
-# 4. 权重 (Chapter 9 - Ensemble)
-# 我们认为这4个策略一样好，所以权重平均
-WEIGHTS = [0.25, 0.25, 0.25, 0.25]
-# 波动率计算周期 (用于归一化)
-VOLATILITY_SPAN = 36
-# 预测值放大系数 (Scalar)
-# 原始预测值通常在 -2 到 +2 之间，乘以这个系数方便观察
-DEFAULT_SCALAR = 10.0
-
-# ==========================================
-# 3. 策略执行参数 (Execution Parameters)
-# ==========================================
-# 这里的参数决定了 Jarvis 怎么下单
-
-# 缓冲区 (Buffer / Hysteresis)
-# 只有当 (目标仓位 - 当前仓位) 的绝对值大于此值时，才调仓
-# 防止在震荡市被手续费磨损
-POSITION_BUFFER = 0.10  # 10%
-# ==========================================
-# 4. 回测环境配置 (Simulation)
-# ==========================================
-# 初始资金 (美元)
-INITIAL_CAPITAL = 10000.0
-TARGET_VOLATILITY = 1.00  # 年化波动率目标 (20% is Carver's standard)
-IDM = 1.0                  # 暂时设为 1.0 (单一资产)
-# 最大杠杆限制 (硬顶)
-# 防止波动率极低时算出一个 100倍杠杆把账户爆了
-MAX_LEVERAGE=4.0
-# 交易手续费率
-# Binance 现货通常是 0.1% (0.001)，BNB 抵扣是 0.075% (0.00075)
-# 量化通常设得高一点作为滑点保护，比如 万五 (0.0005)
-FEE_RATE = 0.0005
-
-# 回测时间段 (样本内/样本外切分点)
-# 格式: 'YYYY-MM-DD'
-START_DATE = '2020-01-01'
-SPLIT_DATE = '2023-01-01' # 之前是 IS，之后是 OOS
-END_DATE = '2026-01-01'
-# [V2.0 Update] Sigma 熔断阈值
-# 如果单小时涨跌幅超过x倍标准差，视为流动性黑洞，强制清零
-SIGMA_THRESHOLD = 4.0
-# 利用小时内 Low 进行更灵敏的防护，比熔断更早触发
-STOP_LOSS_SIGMA = 6.0
-# [V2.1 New] 熔断方向
-# 'down' = 只防暴跌 (适合做多或不做空大跌)，上涨不熔断
-# 'both' = 双向熔断 (原有逻辑)
-MELTDOWN_DIRECTION = 'down'
+    WEIGHTS = [0.25, 0.25, 0.25, 0.25]
+    VOL_LOOKBACK = 36  # 1周 (更稳健的波动率基准)
+    
+    # ==========================================
+    # 3. 执行参数 (Execution)
+    # ==========================================
+    POSITION_BUFFER = 0.10
+    FEE_RATE = 0.0005
+    
+    # ==========================================
+    # 5. 风险引擎 V3.0 (Robust Risk Engine)
+    # ==========================================
+    # 核心指标选择: 'MAD' (推荐), 'ATR', 'STD', 'QUANTILE'
+    RISK_METRIC = 'MAD' 
+    
+    # 稳健观察窗口 (1周 = 168小时)
+    # 相比 V2.1 的 168，这里专门用于计算中位数/分位数，样本量需足够
+    MAD_WINDOW = 168  
+    
+    # 止损乘数 (配合 MAD 使用)
+    # MAD * 5.0 ≈ 3.3 Sigma (正态分布下 1 Sigma ≈ 1.4826 MAD)
+    # 5.0 是一个非常稳健的防插针阈值
+    STOP_LOSS_MULTIPLIER = 5.0
+    
+    # ATR 乘数 (如果使用 ATR 模式)
+    ATR_MULTIPLIER = 3.0
+    ATR_WINDOW = 24
