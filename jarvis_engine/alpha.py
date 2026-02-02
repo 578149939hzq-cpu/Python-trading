@@ -123,20 +123,138 @@ def calculate_scaled_forecast(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 # ... (run_vectorized_backtest 和 calculate_position_target 保持不变) ...
-def run_vectorized_backtest(df:pd.DataFrame,fee_rate=0.0005)->pd.DataFrame:
-
-    # 保持原样
-    data=df.copy()
-    data["market_log_ret"]=np.log(data['close']).diff().fillna(0)
-    data['strategy_log_ret']=data['position']*data['market_log_ret']
-    position_change=data['position'].diff().abs().fillna(0)
-    data['cost']=position_change*fee_rate
-    data['net_log_ret']=data['strategy_log_ret']-data['cost']
+def run_vectorized_backtest(df: pd.DataFrame, fee_rate=0.0005) -> pd.DataFrame:
+    """
+    [Backtest Engine V2.1] 成本修正
+    """
+    data = df.copy()
+    data["market_log_ret"] = np.log(data['close']).diff().fillna(0)
+    
+    # ==========================================
+    # ⚡ 止损成本修正 (Cost Correction)
+    # ==========================================
+    # 物理意义：如果发生了风控事件，我们不能按收盘价结算。
+    # 我们假设在触及止损线的那一刻（Intraday）就已经离场了。
+    # 修正后的回报 = log(1 - sl_threshold)
+    
+    # 1. 复制一份市场回报
+    adjusted_market_ret = data['market_log_ret'].copy()
+    
+    # 2. 找出触发风控的时刻
+    risk_mask = data.get('sigma_event', False)
+    
+    if risk_mask.any():
+        # 获取当时的止损阈值 (e.g. 0.02)
+        sl_values = data.loc[risk_mask, 'sl_threshold']
+        
+        # 计算修正回报: log(1 - 0.02) ≈ -0.02
+        # 无论原本跌了多少 (比如 -10%)，我们都按 -2% 结算
+        correction = np.log(1.0 - sl_values)
+        
+        # 应用修正
+        adjusted_market_ret.loc[risk_mask] = correction
+        
+    # 3. 计算策略回报
+    # 使用修正后的市场回报
+    data['strategy_log_ret'] = data['position'] * adjusted_market_ret
+    
+    position_change = data['position'].diff().abs().fillna(0)
+    data['cost'] = position_change * fee_rate
+    data['net_log_ret'] = data['strategy_log_ret'] - data['cost']
     data['equity'] = np.exp(data['net_log_ret'].cumsum())
-    data['buy_hold_equity']=np.exp(data['market_log_ret'].cumsum())
+    data['buy_hold_equity'] = np.exp(data['market_log_ret'].cumsum())
+    
     return data
 
 def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=0.1) -> pd.DataFrame:
+    """
+    [Risk Engine V2.1] 进攻型防护
+    1. 动态杠杆 (Vol-Targeting)
+    2. 瞬时止损 (Intraday Stop-loss): 盘中跌破 2sigma 即刻离场
+    3. 单向熔断 (One-way Airbag): 只防暴跌，不防暴涨
+    """
+    from config import Config
+    data = df.copy()
+    
+    # ==========================================
+    # 1. 基础波动率与杠杆
+    # ==========================================
+    hourly_ret = data['close'].pct_change().fillna(0)
+    hourly_sigma = hourly_ret.ewm(span=Config.VOL_LOOKBACK).std().fillna(0)
+    data['ann_vol_pct'] = hourly_sigma * np.sqrt(365 * 24)
+    
+    safe_vol = data['ann_vol_pct'].replace(0, 1e-6)
+    leverage_ratio = (Config.TARGET_VOLATILITY / safe_vol).clip(upper=Config.MAX_LEVERAGE)
+    data['leverage_ratio'] = leverage_ratio
+    
+    # 基础目标仓位
+    ideal_position = (data[forecast_col] / 20.0) * leverage_ratio
+    
+    # ==========================================
+    # 2. 风险引擎 V2.1 核心逻辑
+    # ==========================================
+    
+    # --- A. 瞬时止损 (Intraday Stop-loss) ---
+    # 计算小时内的最大跌幅: (Low - Open) / Open
+    # 注意：我们必须确保数据里有 low 和 open 列
+    if 'low' in data.columns and 'open' in data.columns:
+        intraday_drop = (data['low'] - data['open']) / data['open']
+    else:
+        intraday_drop = pd.Series(0, index=data.index) # 如果没数据，默认不触发
+    
+    # 止损阈值 (比如 2.0 倍标准差)
+    # sl_limit 是一个正数 (e.g. 0.02)
+    sl_limit = hourly_sigma * Config.STOP_LOSS_SIGMA
+    data['sl_threshold'] = sl_limit # 保存供回测修正成本使用
+    
+    # 触发条件: 跌幅超过阈值 (drop < -limit)
+    stop_loss_mask = intraday_drop < -sl_limit
+    
+    # --- B. 单向熔断 (One-way Meltdown) ---
+    # 阈值 (比如 3.0 倍标准差)
+    sigma_limit = hourly_sigma * Config.SIGMA_THRESHOLD
+    
+    if getattr(Config, 'MELTDOWN_DIRECTION', 'both') == 'down':
+        # 只针对向下暴跌熔断 (Ret < -Limit)
+        # 如果是暴涨 (Ret > Limit)，我们假设是 God Candle，不熔断
+        meltdown_mask = hourly_ret < -sigma_limit
+    # else:
+    #     # 双向熔断 (旧逻辑)
+    #     meltdown_mask = abs(hourly_ret) > sigma_limit
+        
+    # --- C. 综合风控执行 ---
+    # 任何一种情况发生，都视为风险事件
+    risk_event = meltdown_mask | stop_loss_mask
+    
+    # 记录详细状态 (供诊断绘图)
+    data['sigma_event'] = risk_event
+    data['is_meltdown'] = meltdown_mask
+    data['is_stop_loss'] = stop_loss_mask
+    
+    # ⚡️ 强制清仓 (Hard Stop)
+    # 只要触发风控，当且仅当该时刻，目标仓位强制归零
+    ideal_position = np.where(risk_event, 0.0, ideal_position)
+    
+    # 再次截断 (Cap)
+    ideal_position = ideal_position.clip(-Config.MAX_LEVERAGE, Config.MAX_LEVERAGE)
+    
+    # ==========================================
+    # 3. 缓冲器 (Buffer)
+    # ==========================================
+    ideal_values = ideal_position
+    n = len(ideal_values)
+    buffered_position = np.zeros(n)
+    current_pos = 0.0
+    for i in range(n):
+        if abs(ideal_values[i] - current_pos) > buffer:
+            current_pos = ideal_values[i]
+        buffered_position[i] = current_pos
+        
+    data['raw_target'] = ideal_position
+    data['buffered_pos'] = buffered_position
+    data['position'] = data['buffered_pos'].shift(1).fillna(0)
+    
+    return data
     """
     [Risk Engine V2.0]
     1. 统一波动率计算 (Return Volatility)

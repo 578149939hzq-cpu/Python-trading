@@ -7,9 +7,9 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 数据存储路径
-# C 语言习惯：不要把路径写死成 "C:\\Users\\..."，用相对路径
-DATA_RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
-DATA_PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
+# ✅ 正确写法 (找 data_raw)
+DATA_RAW_DIR = os.path.join(BASE_DIR, "data_raw")
+DATA_PROCESSED_DIR = os.path.join(BASE_DIR, "data_processed")
 # 默认交易对文件
 DEFAULT_SYMBOL = "BTCUSDT"
 DATA_FILE_NAME = "Binance_BTCUSDT_1h.csv"
@@ -34,7 +34,6 @@ WEIGHTS = [0.25, 0.25, 0.25, 0.25]
 VOLATILITY_SPAN = 36
 # 预测值放大系数 (Scalar)
 # 原始预测值通常在 -2 到 +2 之间，乘以这个系数方便观察
-# 在 Phase 3 网格搜索中，这个值会被动态替换
 DEFAULT_SCALAR = 10.0
 
 # ==========================================
@@ -67,5 +66,11 @@ START_DATE = '2020-01-01'
 SPLIT_DATE = '2023-01-01' # 之前是 IS，之后是 OOS
 END_DATE = '2026-01-01'
 # [V2.0 Update] Sigma 熔断阈值
-# 如果单小时涨跌幅超过 3倍标准差，视为流动性黑洞，强制清零
+# 如果单小时涨跌幅超过x倍标准差，视为流动性黑洞，强制清零
 SIGMA_THRESHOLD = 4.0
+# 利用小时内 Low 进行更灵敏的防护，比熔断更早触发
+STOP_LOSS_SIGMA = 6.0
+# [V2.1 New] 熔断方向
+# 'down' = 只防暴跌 (适合做多或不做空大跌)，上涨不熔断
+# 'both' = 双向熔断 (原有逻辑)
+MELTDOWN_DIRECTION = 'down'
