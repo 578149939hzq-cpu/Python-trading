@@ -1,3 +1,6 @@
+import config
+import importlib
+importlib.reload(config)
 import sys
 import os
 import pandas as pd

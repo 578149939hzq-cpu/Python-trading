@@ -10,17 +10,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # C 语言习惯：不要把路径写死成 "C:\\Users\\..."，用相对路径
 DATA_RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 DATA_PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-
 # 默认交易对文件
 DEFAULT_SYMBOL = "BTCUSDT"
 DATA_FILE_NAME = "Binance_BTCUSDT_1h.csv"
 DATA_PATH = os.path.join(DATA_RAW_DIR, DATA_FILE_NAME)
-
 # ==========================================
 # 2. Alpha 核心参数 (Brain Parameters)
 # ==========================================
 # 这里的参数决定了 Jarvis 怎么看待市场
-
 # Robert Carver 的 EWMA 周期组合
 # 这里的数字代表 "Span" (指数衰减跨度)，不是简单的 Window
 # 8=极快, 64=长期趋势
@@ -35,7 +32,6 @@ STRATEGY_PARAMS = {
 WEIGHTS = [0.25, 0.25, 0.25, 0.25]
 # 波动率计算周期 (用于归一化)
 VOLATILITY_SPAN = 36
-
 # 预测值放大系数 (Scalar)
 # 原始预测值通常在 -2 到 +2 之间，乘以这个系数方便观察
 # 在 Phase 3 网格搜索中，这个值会被动态替换
