@@ -1,12 +1,11 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-# 🆕 引入配置文件
 from config import Config
 
 def load_price_data(csv_path: str) -> pd.DataFrame:
-    # ... (保持你原有的加载代码不变，非常完美) ...
-    # 1. 初次尝试读取
+    """
+    加载并清洗数据 (Standard Loading)
+    """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception as e:
@@ -22,12 +21,9 @@ def load_price_data(csv_path: str) -> pd.DataFrame:
         df["time"] = pd.to_datetime(df["timestamp"])
     elif "unix" in df.columns:
         df["unix"] = pd.to_numeric(df["unix"], errors='coerce')
-        max_ts = df["unix"].max()
-        if pd.isna(max_ts) or max_ts == 0:
-            return pd.DataFrame()
-        if max_ts > 1e14: unit = 'us'
-        elif max_ts > 1e11: unit = 'ms'
-        else: unit = 's'
+        unit = 'ms'
+        if df["unix"].max() > 1e14: unit = 'us'
+        elif df["unix"].max() < 1e11: unit = 's'
         df["time"] = pd.to_datetime(df["unix"], unit=unit)
     elif "date" in df.columns:
          df["time"] = pd.to_datetime(df["date"])
@@ -35,155 +31,117 @@ def load_price_data(csv_path: str) -> pd.DataFrame:
         return pd.DataFrame() 
 
     df = df.set_index("time").sort_index()
-    df = df[df.index > pd.to_datetime("2010-01-01")]
-    
-    required_cols = ["open", "high", "low", "close"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"文件 {csv_path} 缺少列: {col}")
-    if "volume" not in df.columns and "vol" in df.columns:
-        df["volume"] = df["vol"]
-
-    df["ret"] = df["close"].pct_change().fillna(0)
+    # 补全 OHLC
+    for c in ['open', 'high', 'low', 'close']:
+        if c not in df.columns: df[c] = df['close']
+            
     return df
+
+# ==========================================
+# [Core Upgrade A] 预处理降噪层
+# ==========================================
+def denoise_price_data(df: pd.DataFrame, window=24, threshold=5.0) -> pd.DataFrame:
+    """
+    Alpha Lab 降噪算法 (MAD Outlier Filter)
+    -------------------------------------------------------
+    金融逻辑: 
+    Crypto 市场常出现 "Flash Crash" (瞬间插针) 或 "Scam Wick"。
+    这些非理性的价格突变会破坏均线系统，导致频繁的虚假信号。
+    本函数使用稳健统计学方法，识别并压平这些噪音。
+    
+    算法:
+    1. 计算价格的中位数趋势 (Rolling Median)。
+    2. 计算绝对偏差 (Absolute Deviation)。
+    3. 识别偏离中位数超过 N 倍 MAD 的点。
+    4. Winsorization: 将离群点替换为边界值，而非删除。
+    """
+    df_clean = df.copy()
+    close = df_clean['close']
+    
+    # 1. 稳健趋势 (Robust Trend)
+    roll_median = close.rolling(window=window).median()
+    
+    # 2. 绝对偏差 (Robust Dispersion)
+    abs_diff = abs(close - roll_median)
+    
+    # 3. MAD (Median Absolute Deviation)
+    mad = abs_diff.rolling(window=window).median()
+    
+    # 4. 动态边界 (Dynamic Bounds)
+    # 允许价格在 [Median - K*MAD, Median + K*MAD] 范围内波动
+    upper_bound = roll_median + threshold * mad
+    lower_bound = roll_median - threshold * mad
+    
+    # 5. 去噪动作 (Winsorization)
+    # 逻辑: 如果价格向上插针，强制压回上轨；向下插针，强制托回下轨。
+    df_clean['close'] = np.where(close > upper_bound, upper_bound, 
+                                 np.where(close < lower_bound, lower_bound, close))
+    
+    # 同步修正 High/Low，防止出现 High < Close 的逻辑错误
+    if 'high' in df_clean.columns:
+        df_clean['high'] = np.where(df_clean['high'] > upper_bound, upper_bound, df_clean['high'])
+    if 'low' in df_clean.columns:
+        df_clean['low'] = np.where(df_clean['low'] < lower_bound, lower_bound, df_clean['low'])
+        
+    return df_clean
 
 def calculate_scaled_forecast(df: pd.DataFrame) -> pd.DataFrame:
     """
-    🔥 核心升级: 基于 Config 参数的 EWMAC (均线交叉) 策略
-    
-    逻辑链条:
-    1. 计算波动率 (分母)
-    2. 计算 4 组均线交叉 (分子)
-    3. 乘以对应的 Scalar (缩放)
-    4. 加权平均 (集成)
+    [Refactored] 集成去噪层的信号生成器
     """
+    # 1. 调用降噪层 (Preprocessing)
+    # 使用清洗后的数据来计算均线，信号更纯净
+    clean_df = denoise_price_data(df, window=Config.MAD_WINDOW, threshold=Config.MAD_THRESHOLD)
+    
+    # 我们将在 clean_df 上计算指标，最后将 forecast 赋值回原 df
     data = df.copy()
     
-    # ==========================================
-    # 🧠 步骤 A: 计算波动率 (Standard Deviation)
-    # ==========================================
-    # 使用 Config 中的窗口 (通常是 36)
-    # 物理意义：风险标尺。
-    vol_span = Config.VOL_LOOKBACK
-    data['volatility'] = data['close'].ewm(span=vol_span).std()
+    # [Core Upgrade C] 长期稳健波动率
+    vol_span = getattr(Config, 'VOL_LOOKBACK', 480) 
+    clean_df['volatility'] = clean_df['close'].ewm(span=vol_span).std().replace(0, np.nan).fillna(method='ffill') + 1e-8
     
-    # 防除零保护 (加上一个极小值)
-    data['volatility'] = data['volatility'].replace(0, np.nan).fillna(method='ffill') + 1e-8
-    
-    # ==========================================
-    # ⚡ 步骤 B: 循环计算 4 个子策略
-    # ==========================================
     fast_spans = Config.STRATEGY_PARAMS['fast_span']
     slow_spans = Config.STRATEGY_PARAMS['slow_span']
     scalars = Config.STRATEGY_PARAMS['scalars']
     weights = Config.WEIGHTS
     
-    # 用于存储各子策略的"标准化 Forecast"
     forecast_cols = []
-    
-    print(f"🔄 正在计算 {len(fast_spans)} 组 EWMAC 策略...")
-    
     for i in range(len(fast_spans)):
-        fast = fast_spans[i]
-        slow = slow_spans[i]
-        scalar = scalars[i]
-        
-        # 1. 计算快慢均线
-        ema_fast = data['close'].ewm(span=fast).mean()
-        ema_slow = data['close'].ewm(span=slow).mean()
-        
-        # 2. 原始交叉值 (Raw Cross) = 快线 - 慢线
-        raw_cross = ema_fast - ema_slow
-        
-        # 3. 标准化预测 (Scaled Forecast)
-        # 公式: (快 - 慢) * Scalar / 波动率
-        # 含义: 当前的均线差值，相当于多少倍的日波动率？
-        col_name = f'fc_{fast}_{slow}'
-        data[col_name] = (raw_cross * scalar) / data['volatility']
-        
-        forecast_cols.append(col_name)
-        # print(f"   ✅ 策略 {fast}/{slow}: Scalar={scalar}")
+        fast, slow, scalar = fast_spans[i], slow_spans[i], scalars[i]
+        # 使用去噪后的价格计算均线交叉
+        raw = clean_df['close'].ewm(span=fast).mean() - clean_df['close'].ewm(span=slow).mean()
+        col = f'fc_{fast}_{slow}'
+        # 信号归一化
+        clean_df[col] = (raw * scalar) / clean_df['volatility']
+        forecast_cols.append(col)
 
-    # ==========================================
-    # ⚖️ 步骤 C: 集成 (Ensemble)
-    # ==========================================
-    # 加权平均
-    # 这里的 weights 都在 Config 里 (0.25, 0.25, 0.25, 0.25)
-    combined_forecast = data[forecast_cols].mul(weights).sum(axis=1)
+    combined = clean_df[forecast_cols].mul(weights).sum(axis=1)
     
-    # ==========================================
-    # 🛡️ 步骤 D: 封顶 (Capping)
-    # ==========================================
-    # Carver 建议单个策略通常限制在 +/- 20 之间
-    data['forecast'] = combined_forecast.clip(lower=-20.0, upper=20.0).fillna(0)
-    
-    # 记录一些调试信息
-    data['ema_slow_base'] = data['close'].ewm(span=slow_spans[-1]).mean() # 画图用最慢的线
-    
-    return data
-
-# ... (run_vectorized_backtest 和 calculate_position_target 保持不变) ...
-def run_vectorized_backtest(df: pd.DataFrame, fee_rate=0.0005) -> pd.DataFrame:
-    """
-    [Backtest Engine V2.1] 成本修正
-    """
-    data = df.copy()
-    data["market_log_ret"] = np.log(data['close']).diff().fillna(0)
-    
-    # ==========================================
-    # ⚡ 止损成本修正 (Cost Correction)
-    # ==========================================
-    # 物理意义：如果发生了风控事件，我们不能按收盘价结算。
-    # 我们假设在触及止损线的那一刻（Intraday）就已经离场了。
-    # 修正后的回报 = log(1 - sl_threshold)
-    
-    # 1. 复制一份市场回报
-    adjusted_market_ret = data['market_log_ret'].copy()
-    
-    # 2. 找出触发风控的时刻
-    risk_mask = data.get('sigma_event', False)
-    
-    if risk_mask.any():
-        # 获取当时的止损阈值 (e.g. 0.02)
-        sl_values = data.loc[risk_mask, 'sl_threshold']
-        
-        # 计算修正回报: log(1 - 0.02) ≈ -0.02
-        # 无论原本跌了多少 (比如 -10%)，我们都按 -2% 结算
-        correction = np.log(1.0 - sl_values)
-        
-        # 应用修正
-        adjusted_market_ret.loc[risk_mask] = correction
-        
-    # 3. 计算策略回报
-    # 使用修正后的市场回报
-    data['strategy_log_ret'] = data['position'] * adjusted_market_ret
-    
-    position_change = data['position'].diff().abs().fillna(0)
-    data['cost'] = position_change * fee_rate
-    data['net_log_ret'] = data['strategy_log_ret'] - data['cost']
-    data['equity'] = np.exp(data['net_log_ret'].cumsum())
-    data['buy_hold_equity'] = np.exp(data['market_log_ret'].cumsum())
+    # 将计算好的纯净信号注入回原始数据流
+    data['forecast'] = combined.clip(-20, 20).fillna(0)
+    # 同时也保存去噪后的波动率，供后续参考
+    data['volatility'] = clean_df['volatility']
     
     return data
 
 def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=0.1) -> pd.DataFrame:
     """
-    [Risk Engine V2.1] 进攻型防护
-    1. 动态杠杆 (Vol-Targeting)
-    2. 瞬时止损 (Intraday Stop-loss): 盘中跌破 2sigma 即刻离场
-    3. 单向熔断 (One-way Airbag): 只防暴跌，不防暴涨
+    [Core Upgrade B] 集成 ATR 动态止损的持仓计算
     """
-    from config import Config
     data = df.copy()
     
     # ==========================================
-    # 1. 基础波动率与杠杆
+    # 1. 稳健杠杆计算 (Stable Sizing)
     # ==========================================
+    # 使用 Config.VOL_LOOKBACK (480) 计算长期波动率
     hourly_ret = data['close'].pct_change().fillna(0)
-    hourly_sigma = hourly_ret.ewm(span=Config.VOL_LOOKBACK).std().fillna(0)
-    data['ann_vol_pct'] = hourly_sigma * np.sqrt(365 * 24)
+    long_term_vol = hourly_ret.ewm(span=Config.VOL_LOOKBACK).std().fillna(0)
     
-    safe_vol = data['ann_vol_pct'].replace(0, 1e-6)
+    # 年化
+    ann_vol_pct = long_term_vol * np.sqrt(365 * 24)
+    data['ann_vol_pct'] = ann_vol_pct # For diagnostics
+    
+    safe_vol = ann_vol_pct.replace(0, 1e-6)
     leverage_ratio = (Config.TARGET_VOLATILITY / safe_vol).clip(upper=Config.MAX_LEVERAGE)
     data['leverage_ratio'] = leverage_ratio
     
@@ -191,55 +149,67 @@ def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=
     ideal_position = (data[forecast_col] / 20.0) * leverage_ratio
     
     # ==========================================
-    # 2. 风险引擎 V2.1 核心逻辑
+    # 2. ATR 动态风控 (Dynamic Risk)
     # ==========================================
+    # 金融逻辑: ATR (平均真实波幅) 代表了市场当前的"呼吸节奏"。
+    # 止损阈值不应是固定的 %，而应是 ATR 的倍数。
+    # 波动大时，止损放宽，避免被正常波动洗出；波动小时，止损收紧，快速截断亏损。
     
-    # --- A. 瞬时止损 (Intraday Stop-loss) ---
-    # 计算小时内的最大跌幅: (Low - Open) / Open
-    # 注意：我们必须确保数据里有 low 和 open 列
+    # A. 计算 True Range
+    high = data['high']
+    low = data['low']
+    close = data['close']
+    prev_close = close.shift(1)
+    
+    tr1 = high - low
+    tr2 = abs(high - prev_close)
+    tr3 = abs(low - prev_close)
+    # 逐元素取最大值
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # B. 计算 ATR (Window=24)
+    atr = tr.ewm(span=Config.ATR_WINDOW).mean()
+    
+    # C. 计算动态止损阈值 (百分比)
+    # Stop Threshold % = (ATR * Multiplier) / Price
+    atr_threshold_pct = (atr * Config.ATR_MULTIPLIER) / close
+    
+    # 更新系统阈值 (这将直接影响回测中的 Gap 修正)
+    data['sl_threshold'] = atr_threshold_pct
+    data['vol_raw'] = atr / close # 记录原始波动率单位(%)
+    
+    # ==========================================
+    # 3. 执行风控 (Intraday Stop & Meltdown)
+    # ==========================================
+    # 使用 ATR 阈值进行判断
+    
+    # A. 瞬时止损 (Low Price Check)
     if 'low' in data.columns and 'open' in data.columns:
         intraday_drop = (data['low'] - data['open']) / data['open']
+        stop_loss_mask = intraday_drop < -atr_threshold_pct
     else:
-        intraday_drop = pd.Series(0, index=data.index) # 如果没数据，默认不触发
-    
-    # 止损阈值 (比如 2.0 倍标准差)
-    # sl_limit 是一个正数 (e.g. 0.02)
-    sl_limit = hourly_sigma * Config.STOP_LOSS_SIGMA
-    data['sl_threshold'] = sl_limit # 保存供回测修正成本使用
-    
-    # 触发条件: 跌幅超过阈值 (drop < -limit)
-    stop_loss_mask = intraday_drop < -sl_limit
-    
-    # --- B. 单向熔断 (One-way Meltdown) ---
-    # 阈值 (比如 3.0 倍标准差)
-    sigma_limit = hourly_sigma * Config.SIGMA_THRESHOLD
-    
-    if getattr(Config, 'MELTDOWN_DIRECTION', 'both') == 'down':
-        # 只针对向下暴跌熔断 (Ret < -Limit)
-        # 如果是暴涨 (Ret > Limit)，我们假设是 God Candle，不熔断
-        meltdown_mask = hourly_ret < -sigma_limit
-    # else:
-    #     # 双向熔断 (旧逻辑)
-    #     meltdown_mask = abs(hourly_ret) > sigma_limit
+        stop_loss_mask = pd.Series(False, index=data.index)
         
-    # --- C. 综合风控执行 ---
-    # 任何一种情况发生，都视为风险事件
+    # B. 单向熔断 (Close Price Check)
+    meltdown_dir = getattr(Config, 'MELTDOWN_DIRECTION', 'down')
+    if meltdown_dir == 'down':
+        meltdown_mask = hourly_ret < -atr_threshold_pct
+    else:
+        meltdown_mask = abs(hourly_ret) > atr_threshold_pct
+    
+    # 触发风控
     risk_event = meltdown_mask | stop_loss_mask
     
-    # 记录详细状态 (供诊断绘图)
     data['sigma_event'] = risk_event
     data['is_meltdown'] = meltdown_mask
     data['is_stop_loss'] = stop_loss_mask
     
-    # ⚡️ 强制清仓 (Hard Stop)
-    # 只要触发风控，当且仅当该时刻，目标仓位强制归零
+    # 仓位清零
     ideal_position = np.where(risk_event, 0.0, ideal_position)
-    
-    # 再次截断 (Cap)
     ideal_position = ideal_position.clip(-Config.MAX_LEVERAGE, Config.MAX_LEVERAGE)
     
     # ==========================================
-    # 3. 缓冲器 (Buffer)
+    # 4. 缓冲器 (Buffer)
     # ==========================================
     ideal_values = ideal_position
     n = len(ideal_values)
@@ -255,93 +225,47 @@ def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=
     data['position'] = data['buffered_pos'].shift(1).fillna(0)
     
     return data
-    """
-    [Risk Engine V2.0]
-    1. 统一波动率计算 (Return Volatility)
-    2. 动态杠杆 (Vol-Targeting)
-    3. Sigma 熔断 (Safety Airbag)
-    """
-    # 局部引入 Config，确保能读取到 main.py 中注入的最新参数
-    from config import Config
 
+def run_vectorized_backtest(df: pd.DataFrame, fee_rate=0.0005) -> pd.DataFrame:
+    """
+    [Backtest Engine] ATR 适配版
+    """
     data = df.copy()
-
-    # ==========================================
-    # 1. 统一波动率计算 (The Right Way)
-    # ==========================================
-    # 直接计算"收益率"的波动率，而非价格的标准差
-    hourly_ret = data['close'].pct_change().fillna(0)
-
-    # 使用 config 中的长周期 (默认168=一周) 计算稳健波动率
-    # 注意：这里得到的是"小时级标准差" (Hourly Sigma)
-    hourly_sigma = hourly_ret.ewm(span=Config.VOL_LOOKBACK).std().fillna(0)
-
-    # 转化为年化波动率 (用于计算杠杆)
-    # Annual Vol = Hourly Sigma * sqrt(8760)
-    data['ann_vol_pct'] = hourly_sigma * np.sqrt(365 * 24)
-
-    # ==========================================
-    # 2. 计算动态杠杆 (Dynamic Leverage)
-    # ==========================================
-    # 避免除以零
-    safe_vol = data['ann_vol_pct'].replace(0, 1e-6)
-
-    # 公式：目标波动率 / 当前波动率
-    # 如果目标是20%，当前波动率是10%，则上2倍杠杆
-    leverage_ratio = Config.TARGET_VOLATILITY / safe_vol
-
-    # 封顶：不超过最大允许杠杆 (例如 2.0x)
-    leverage_ratio = leverage_ratio.clip(upper=Config.MAX_LEVERAGE)
-    data['leverage_ratio'] = leverage_ratio
-
-    # ==========================================
-    # 3. 基础目标仓位
-    # ==========================================
-    # 归一化预测值 (-1 ~ 1)
-    raw_position = data[forecast_col] / 20.0
-
-    # 叠加杠杆
-    ideal_position = raw_position * leverage_ratio
-
-    # ==========================================
-    # 4. Sigma 熔断机制 (Safety Airbag) !!!
-    # ==========================================
-    # 计算当前的容忍上限：N倍标准差
-    # 如果当前这一小时跌幅超过了 3倍的历史平均波动，说明市场流动性枯竭
-    sigma_limit = hourly_sigma * Config.SIGMA_THRESHOLD
-
-    # 标记熔断时刻
-    # abs(hourly_ret) 代表无论暴涨还是暴跌，只要剧烈波动就熔断
-    meltdown_mask = abs(hourly_ret) > sigma_limit
-
-    # 记录熔断事件 (供诊断绘图用)
-    data['sigma_event'] = meltdown_mask
-
-    # ⚡️ 强制清仓
-    # 在熔断时刻，将目标仓位强行设为 0
-    ideal_position = np.where(meltdown_mask, 0.0, ideal_position)
-
-    # 再次截断最终仓位 (防止逻辑漏洞)
-    ideal_position = np.clip(ideal_position, -Config.MAX_LEVERAGE, Config.MAX_LEVERAGE)
-
-    # ==========================================
-    # 5. 缓冲器 (Buffer)
-    # ==========================================
-    ideal_values = ideal_position
-    n = len(ideal_values)
-    buffered_position = np.zeros(n)
-    current_pos = 0.0
-
-    for i in range(n):
-        ideal = ideal_values[i]
-        # 只有当新目标和当前持仓的差距超过 buffer 时，才调仓
-        if abs(ideal - current_pos) > buffer:
-            current_pos = ideal
-        buffered_position[i] = current_pos
-
-    data['raw_target'] = ideal_position
-    data['buffered_pos'] = buffered_position
-    # Shift(1) 代表“下根K线执行”，防止未来函数
-    data['position'] = data['buffered_pos'].shift(1).fillna(0)
-
+    data["market_log_ret"] = np.log(data['close']).diff().fillna(0)
+    
+    # 1. 复制市场回报
+    adjusted_market_ret = data['market_log_ret'].copy()
+    
+    # 2. 修正风控时刻的回报 (ATR Gap Correction)
+    risk_mask = data.get('sigma_event', False)
+    
+    if risk_mask.any():
+        # 获取 ATR 动态阈值
+        sl_values = data.loc[risk_mask, 'sl_threshold']
+        
+        prev_close = data.loc[risk_mask, 'close'].shift(1)
+        open_price = data.loc[risk_mask, 'open']
+        
+        # 止损价 = 开盘价 * (1 - ATR_Threshold%)
+        stop_price = open_price * (1.0 - sl_values)
+        
+        correction = np.log(stop_price / prev_close)
+        correction = correction.fillna(adjusted_market_ret.loc[risk_mask])
+        adjusted_market_ret.loc[risk_mask] = correction
+        
+    # 3. 计算策略回报
+    data['strategy_log_ret'] = data['position'] * adjusted_market_ret
+    position_change = data['position'].diff().abs().fillna(0)
+    
+    data['cost'] = position_change * fee_rate
+    data['net_log_ret'] = data['strategy_log_ret'] - data['cost']
+    
+    # 4. 资金映射
+    initial_cap = getattr(Config, 'INITIAL_CAPITAL', 10000.0)
+    norm_equity = np.exp(data['net_log_ret'].cumsum())
+    norm_bh_equity = np.exp(data['market_log_ret'].cumsum())
+    
+    data['equity'] = norm_equity * initial_cap
+    data['buy_hold_equity'] = norm_bh_equity * initial_cap
+    
     return data

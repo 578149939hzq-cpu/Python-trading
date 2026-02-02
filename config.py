@@ -1,48 +1,71 @@
 import os
 
 class Config:
+    """
+    Jarvis-Code 全局配置中心 (V3.1 Alpha Lab Edition)
+    集成 MAD 去噪、ATR 动态风控与长期稳健定仓。
+    """
+    
     # ==========================================
     # 1. 基础设施 (Infrastructure)
     # ==========================================
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    # 自动识别：优先找 data_raw (你的实际文件夹)，找不到再找 data/raw
-    if os.path.exists(os.path.join(BASE_DIR, "data_raw")):
-        DATA_PATH = os.path.join(BASE_DIR, "data_raw", "Binance_BTCUSDT_1h.csv")
+
+    # 自动探测数据路径
+    _path_v1 = os.path.join(BASE_DIR, "data_raw", "Binance_BTCUSDT_1h.csv")
+    _path_v2 = os.path.join(BASE_DIR, "data", "raw", "Binance_BTCUSDT_1h.csv")
+    
+    if os.path.exists(_path_v1):
+        DATA_PATH = _path_v1
+    elif os.path.exists(_path_v2):
+        DATA_PATH = _path_v2
     else:
-        DATA_PATH = os.path.join(BASE_DIR, "data", "raw", "Binance_BTCUSDT_1h.csv")
+        DATA_PATH = _path_v1
 
     # ==========================================
-    # 2. 策略参数 (Alpha Params)
+    # 2. Alpha 策略参数 (Brain Parameters)
     # ==========================================
     STRATEGY_PARAMS = {
         'fast_span': [8, 16, 32, 64],
         'slow_span': [32, 64, 128, 256],
-        'scalars': [5.6, 3.8, 2.6, 1.9]
+        'scalars': [5.6, 3.8, 2.6, 1.9] 
     }
+    
     WEIGHTS = [0.25, 0.25, 0.25, 0.25]
-    VOL_LOOKBACK = 36  # 1周 (更稳健的波动率基准)
+    
+    # [Core Upgrade C] 稳健波动率定仓 (Stable Sizing)
+    # 从 36 调整为 480 (约20天)。
+    # 目的: 让仓位锚定长期波动率趋势，忽略短期噪音，避免仓位剧烈抖动。
+    VOL_LOOKBACK = 480
+
+    # ==========================================
+    # 3. 预处理降噪参数 (Denoising Layer)
+    # ==========================================
+    # [Core Upgrade A] MAD 去噪配置
+    MAD_WINDOW = 24       # 滚动窗口 24小时
+    MAD_THRESHOLD = 5.0   # 偏离中位数 5倍 MAD 视为插针
+
+    # ==========================================
+    # 4. 风险引擎 V3.1 (ATR Dynamic Risk)
+    # ==========================================
+    # [Core Upgrade B] ATR 动态止损
+    RISK_METRIC = 'ATR'   # 强制使用 ATR
+    ATR_WINDOW = 24       # 保持对波动率变化的快速响应
+    
+    # 3倍 ATR 约等于 99.7% 置信区间 (正态分布下 3sigma)
+    # 在高波动率时自动放宽止损，低波动率时自动收紧
+    ATR_MULTIPLIER = 3.0 
+    
+    STOP_LOSS_MULTIPLIER = 5.0 # (备用，兼容旧逻辑)
+    MELTDOWN_DIRECTION = 'down'
+
+    # 基础风控
+    TARGET_VOLATILITY = 0.20
+    MAX_LEVERAGE = 2.0
     
     # ==========================================
-    # 3. 执行参数 (Execution)
+    # 5. 回测仿真 (Simulation)
     # ==========================================
-    POSITION_BUFFER = 0.10
+    POSITION_BUFFER = 0.10 
     FEE_RATE = 0.0005
-    
-    # ==========================================
-    # 5. 风险引擎 V3.0 (Robust Risk Engine)
-    # ==========================================
-    # 核心指标选择: 'MAD' (推荐), 'ATR', 'STD', 'QUANTILE'
-    RISK_METRIC = 'MAD' 
-    
-    # 稳健观察窗口 (1周 = 168小时)
-    # 相比 V2.1 的 168，这里专门用于计算中位数/分位数，样本量需足够
-    MAD_WINDOW = 168  
-    
-    # 止损乘数 (配合 MAD 使用)
-    # MAD * 5.0 ≈ 3.3 Sigma (正态分布下 1 Sigma ≈ 1.4826 MAD)
-    # 5.0 是一个非常稳健的防插针阈值
-    STOP_LOSS_MULTIPLIER = 5.0
-    
-    # ATR 乘数 (如果使用 ATR 模式)
-    ATR_MULTIPLIER = 3.0
-    ATR_WINDOW = 24
+    INITIAL_CAPITAL = 10000.0
