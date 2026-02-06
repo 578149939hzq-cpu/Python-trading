@@ -182,65 +182,46 @@ def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=
     
     return data
 
-def run_vectorized_backtest(df: pd.DataFrame, fee_rate=0.0005, funding_rate=0.00001) -> pd.DataFrame:
-    """
-    [Backtest Engine V3.7] 引入资金费率 (Funding Cost)
-    ----------------------------------------------------
-    funding_rate: 默认 0.00005 (万分之五/小时), 约等于年化 40% 的持仓成本。
-    这模拟了在牛市中做多所需的昂贵资金成本。
-    """
+def run_vectorized_backtest(df: pd.DataFrame, fee_rate=0.0005, funding_rate=0.00001):
     data = df.copy()
-    data["market_log_ret"] = np.log(data['close']).diff().fillna(0)
     
-    # 1. 灾难阻断修正 (Gap Correction)
-    adjusted_market_ret = data['market_log_ret'].copy()
+    # [V4.8] 放弃 Log Returns，改用 Simple Returns
+    # 计算基础的市场百分比变化 (Simple Return)
+    data['market_ret'] = data['close'].pct_change().fillna(0)
+    
+    # 灾难止损修正 (使用你之前的劣后成交逻辑，但改为简单收益率)
     risk_mask = data.get('sigma_event', False)
-    
+    adjusted_ret = data['market_ret'].copy()
     if risk_mask.any():
         sl_values = data.loc[risk_mask, 'sl_threshold']
-        prev_close = data.loc[risk_mask, 'close'].shift(1)
         open_price = data.loc[risk_mask, 'open']
-        close_price = data.loc[risk_mask, 'close'] # 获取坑底收盘价
+        close_price = data.loc[risk_mask, 'close']
+        prev_close = data['close'].shift(1).loc[risk_mask]
         
-        # [V4.7 核心修正] 拒绝完美成交
-        # 假设你无法在半山腰止损，如果价格砸穿了，你只能在 Close 成交
-        theoretical_stop = open_price * (1.0 - sl_values)
-        execution_price = np.minimum(theoretical_stop, close_price)
-        
-        # 额外增加 0.2% 的滑点，模拟恐慌性抛售的冲击成本
-        final_exit_price = execution_price * (1.0 - 0.002) 
-        
-        correction = np.log(final_exit_price / prev_close)
-        correction = correction.fillna(adjusted_market_ret.loc[risk_mask])
-        adjusted_market_ret.loc[risk_mask] = correction
-        
-    # 2. 策略毛回报
-    data['strategy_log_ret'] = data['position'] * adjusted_market_ret
+        # 劣后成交：取 理论止损价 和 实际收盘价 的最小值，并扣除 0.5% 极端滑点
+        execution_price = np.minimum(open_price * (1.0 - sl_values), close_price) * 0.995
+        adjusted_ret.loc[risk_mask] = (execution_price / prev_close) - 1.0
+
+    # 策略毛收益 = 仓位 * 调整后的市场收益
+    data['strat_ret_raw'] = data['position'] * adjusted_ret
     
-    # 3. 交易手续费 (Transaction Cost)
-    position_change = data['position'].diff().abs().fillna(0)
-    data['cost'] = position_change * fee_rate
+    # 费用计算
+    pos_change = data['position'].diff().abs().fillna(0)
+    transaction_cost = pos_change * fee_rate
+    funding_cost = data['position'].abs() * funding_rate
     
-    # ==========================================
-    # 4. [V3.7 Update] 资金费率 (Funding Cost)
-    # ==========================================
-    # 逻辑: 只要持有仓位(Position != 0)，每小时都需要支付资金费。
-    # 这里采用绝对值计算，假设无论多空都需要支付费率（保守回测模型）
-    # 如果是做空收费，回测会更乐观，但为了健壮性我们假设是支付。
-    position_size = data['position'].abs()
-    data['funding_cost'] = position_size * funding_rate
+    # 净收益率
+    data['net_ret'] = data['strat_ret_raw'] - transaction_cost - funding_cost
     
-    # 5. 净回报 (Net Return)
-    # Net = Strategy - Transaction - Funding
-    data['net_log_ret'] = data['strategy_log_ret'] - data['cost'] - data['funding_cost']
+    # [V4.8 核心修改] 模拟真实资金曲线 (逐行相乘，而非对数累加)
+    # 这样能更准确地反映大杠杆下的损耗
+    initial_cap = Config.INITIAL_CAPITAL
+    data['equity'] = initial_cap * (1 + data['net_ret']).cumprod()
+    data['buy_hold_equity'] = initial_cap * (1 + data['market_ret']).cumprod()
     
-    # 6. 资金曲线
-    initial_cap = getattr(Config, 'INITIAL_CAPITAL', 10000.0)
-    norm_equity = np.exp(data['net_log_ret'].cumsum())
-    norm_bh_equity = np.exp(data['market_log_ret'].cumsum())
-    
-    data['equity'] = norm_equity * initial_cap
-    data['buy_hold_equity'] = norm_bh_equity * initial_cap
+    # 为了兼容以前的统计函数，保留 net_log_ret
+    data['net_log_ret'] = np.log(1 + data['net_ret'])
+    data['market_log_ret'] = np.log(1 + data['market_ret'])
     
     return data
    

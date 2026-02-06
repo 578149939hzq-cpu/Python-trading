@@ -50,7 +50,7 @@ class Config:
     # 3. 风险管理 (Risk Management)
     # ==========================================
     # A. 波动率目标制 (Vol Scaling) - 负责日常风控
-    TARGET_VOLATILITY = 1.2
+    TARGET_VOLATILITY = 1
     MAX_LEVERAGE = 3
     
     # ------------------------------------------------
@@ -71,6 +71,6 @@ class Config:
     # ==========================================
     # 4. 回测仿真 (Simulation)
     # ==========================================
-    POSITION_BUFFER = 0.25 
-    FEE_RATE = 0.0005
+    POSITION_BUFFER = 0.3 
+    FEE_RATE = 0.001
     INITIAL_CAPITAL = 10000.0
