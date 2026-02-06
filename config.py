@@ -44,26 +44,26 @@ class Config:
     
     # [C] 混合权重分配 (Signal Weights) [V4.0 New]
     # 趋势 70% (进攻), RSI 30% (防守/反转)
-    TREND_WEIGHT = 0.7
-    RSI_WEIGHT = 0.3
+    TREND_WEIGHT = 0.9
+    RSI_WEIGHT = 0.1
     # ==========================================
     # 3. 风险管理 (Risk Management)
     # ==========================================
     # A. 波动率目标制 (Vol Scaling) - 负责日常风控
     TARGET_VOLATILITY = 1.2
-    MAX_LEVERAGE = 2.5
+    MAX_LEVERAGE = 3
     
     # ------------------------------------------------
     # [B] 环境过滤器 (Regime Filter) [V4.0 New]
     # MA200 (日线) = 4800 (小时)
-    REGIME_MA_WINDOW = 4800
+    REGIME_MA_WINDOW = 2400
     # 熊市/猴市下的杠杆上限 (当 Price < MA200)
     # 开启保命模式，强制降杠杆
     BEAR_MODE_MAX_LEVERAGE = 1.0
     # 正常波动 (1x-3x ATR) 由波动率调仓自动处理，不触发硬止损。
     
     SURVIVAL_ATR_WINDOW = 24       # 快速感知崩盘 (1天)
-    SURVIVAL_ATR_MULTIPLIER = 4.5  # 极宽阈值 (约等于单小时暴跌 6%~10%)
+    SURVIVAL_ATR_MULTIPLIER = 6  # 极宽阈值 (约等于单小时暴跌 6%~10%)
     
     # 波动率地板 (防止死鱼行情误触，至少要跌够这个幅度才算崩盘)
     MIN_HOURLY_VOL = 0.005 
@@ -71,6 +71,6 @@ class Config:
     # ==========================================
     # 4. 回测仿真 (Simulation)
     # ==========================================
-    POSITION_BUFFER = 0.1 
+    POSITION_BUFFER = 0.25 
     FEE_RATE = 0.0005
     INITIAL_CAPITAL = 10000.0

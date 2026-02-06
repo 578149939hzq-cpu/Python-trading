@@ -233,6 +233,7 @@ def calculate_drawdown_metrics(equity_series):
         
     return max_drawdown, calmar
 def calculate_trade_metrics(df_res):
+
     """
     [V3.7 Analytics] 交易维度统计
     将连续的持仓序列拆解为独立的 'Round-Trip' 交易进行统计。
@@ -319,6 +320,25 @@ def calculate_trade_metrics(df_res):
     else:
         print("⚠️ 风格: 胜率与赔率需进一步平衡。")
     print("------------------------------------------\n")
+def calculate_performance_summary(equity_series, periods_per_year=24*365):
+    """
+    [V4.6] 计算年化收益与复合增长率
+    """
+    # 1. 计算总收益率
+    total_return = (equity_series.iloc[-1] / equity_series.iloc[0]) - 1.0
+    
+    # 2. 计算回测跨越的年数
+    # 数据点总数 / (每年的小时数)
+    n_days = len(equity_series) / 24
+    n_years = len(equity_series) / periods_per_year
+    
+    # 3. 计算年化收益率 (CAGR - 复合年均增长率)
+    if n_years > 0:
+        ann_return = (1 + total_return) ** (1 / n_years) - 1
+    else:
+        ann_return = np.nan
+        
+    return total_return, ann_return, n_days
 def mission_start():
     print("🚀 Jarvis System Initializing (V3.3 Visualization Upgrade + Leverage Stats)...")
     
@@ -353,12 +373,17 @@ def mission_start():
 
     final = df_res['equity'].iloc[-1]
     sharpe = (df_res['net_log_ret'].mean() / df_res['net_log_ret'].std()) * np.sqrt(365*24)
+    total_ret_strat, ann_ret_strat, n_days = calculate_performance_summary(df_res['equity'])
+    total_ret_bh, ann_ret_bh, _ = calculate_performance_summary(df_res['buy_hold_equity'])
     
+    mdd_strat, calmar_strat = calculate_drawdown_metrics(df_res['equity'])
     # [V3.5 New] Sortino Analysis
     print("\n📊 --- Performance Analytics ---")
     strat_sortino = calculate_sortino(df_res['net_log_ret'])
     btc_sortino = calculate_sortino(df_res['market_log_ret'])
-
+    print(f"🔹 Backtest Period : {n_days:.1f} Days ({n_days/365:.2f} Years)")
+    print(f"🔹 Total Return    : {total_ret_strat:.2%} (B&H: {total_ret_bh:.2%})")
+    print(f"🚀 Annualized Ret  : {ann_ret_strat:.2%} (B&H: {ann_ret_bh:.2%})")
     print(f"🏆 Final Equity: ${final:,.2f} (Initial: ${Config.INITIAL_CAPITAL})")
     print(f"📈 Sharpe Ratio : {sharpe:.2f}")
     

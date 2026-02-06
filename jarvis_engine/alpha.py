@@ -38,61 +38,112 @@ def load_price_data(csv_path: str) -> pd.DataFrame:
 
 def calculate_scaled_forecast(df: pd.DataFrame) -> pd.DataFrame:
     """
-    原始信号生成器
+    [V4.3 The Silence Protocol] 深度平滑混合信号
+    --------------------------------------------
+    1. Trend: 保持不变
+    2. RSI: 实施 "Soft Deadzone" + "Deep Smoothing"，消除跳变。
     """
     data = df.copy()
     
-    # 长期波动率 (用于信号归一化)
+    # --- 1. 基础数据准备 ---
     vol_span = getattr(Config, 'VOL_LOOKBACK', 480) 
     data['volatility'] = data['close'].ewm(span=vol_span).std().replace(0, np.nan).fillna(method='ffill') + 1e-8
     
+    # --- 2. 计算趋势信号 (Trend Component) ---
     fast_spans = Config.STRATEGY_PARAMS['fast_span']
     slow_spans = Config.STRATEGY_PARAMS['slow_span']
     scalars = Config.STRATEGY_PARAMS['scalars']
-    weights = Config.WEIGHTS
+    weights = getattr(Config, 'TREND_INTERNAL_WEIGHTS', [0.25, 0.25, 0.25, 0.25])
     
     forecast_cols = []
     for i in range(len(fast_spans)):
         fast, slow, scalar = fast_spans[i], slow_spans[i], scalars[i]
         raw = data['close'].ewm(span=fast).mean() - data['close'].ewm(span=slow).mean()
         col = f'fc_{fast}_{slow}'
-        # 信号归一化
         data[col] = (raw * scalar) / data['volatility']
         forecast_cols.append(col)
 
-    combined = data[forecast_cols].mul(weights).sum(axis=1)
-    data['forecast'] = combined.clip(-20, 20).fillna(0)
+    trend_forecast = data[forecast_cols].mul(weights).sum(axis=1)
+    
+    # --- 3. [V4.3] 深度平滑版 RSI 反转信号 ---
+    rsi_period = getattr(Config, 'RSI_PERIOD', 14)
+    delta = data['close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/rsi_period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/rsi_period, adjust=False).mean()
+    rs = gain / loss
+    raw_rsi = 100 - (100 / (1 + rs))
+    
+    # [V4.3 优化 A] 加强输入平滑 (3 -> 12小时)
+    # 彻底过滤掉短期的 RSI 噪点
+    smooth_rsi = raw_rsi.rolling(window=12).mean().fillna(50)
+    
+    rsi_diff = 50 - smooth_rsi
+    rsi_scalar = getattr(Config, 'RSI_SCALAR', 1.0)
+    
+    # [V4.3 优化 B] 软死区逻辑 (Soft Deadzone)
+    # 替换之前的 np.where 硬截断。
+    # 逻辑: 当 abs(diff) <= 10 时，输出 0。
+    #       当 abs(diff) > 10 时，输出 (abs(diff) - 10) * sign。
+    # 效果: 信号从 0 线性爬升，不再突变，解决 Buffer 频繁触发问题。
+    # 修复: np.maximum 和 np.sign 返回的是 Series，不会报 ndarray 错误。
+    rsi_forecast = np.sign(rsi_diff) * np.maximum(0, rsi_diff.abs() - 10) * rsi_scalar
+    
+    # [V4.3 优化 C] 输出信号再次平滑
+    # 对最终生成的 Forecast 再做一次 EMA，确保曲线像丝绸一样顺滑
+    rsi_forecast = rsi_forecast.ewm(span=24).mean()
+    
+    # --- 4. 信号融合 ---
+    # 使用配置的权重，默认倾向于趋势 (0.9/0.1 or 0.8/0.2)
+    w_trend = getattr(Config, 'TREND_WEIGHT', 0.9)
+    w_rsi = getattr(Config, 'RSI_WEIGHT', 0.1)
+    
+    data['trend_forecast'] = trend_forecast.clip(-20, 20).fillna(0)
+    data['rsi_forecast'] = rsi_forecast.clip(-20, 20).fillna(0)
+    
+    # 混合输出
+    data['forecast'] = (data['trend_forecast'] * w_trend + data['rsi_forecast'] * w_rsi)
     
     return data
 
 def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=0.1) -> pd.DataFrame:
     """
-    [Risk Engine V3.7] 信号增强版
+    [Risk Engine V4.0] 环境感知型风控 (保持不变)
+    Regime Filter + Vol Scaling + Survival Stop
     """
     data = df.copy()
     
-    # 1. 波动率目标管理
+    # --- 1. 环境过滤器 (Regime Filter) ---
+    ma_window = getattr(Config, 'REGIME_MA_WINDOW', 4800)
+    regime_ma = data['close'].rolling(window=ma_window).mean()
+    is_bull_regime = data['close'] > regime_ma
+    
+    # 动态杠杆上限
+    normal_cap = getattr(Config, 'MAX_LEVERAGE', 2.5)      
+    bear_cap = getattr(Config, 'BEAR_MODE_MAX_LEVERAGE', 1.0) 
+    
+    dynamic_max_cap = np.where(is_bull_regime, normal_cap, bear_cap)
+    data['regime_ma'] = regime_ma 
+    data['dynamic_max_cap'] = dynamic_max_cap
+    
+    # --- 2. 波动率目标管理 (Vol Scaling) ---
     hourly_ret = data['close'].pct_change().fillna(0)
     long_term_vol = hourly_ret.ewm(span=Config.VOL_LOOKBACK).std().fillna(0)
     ann_vol_pct = long_term_vol * np.sqrt(365 * 24)
     data['ann_vol_pct'] = ann_vol_pct
     
     safe_vol = ann_vol_pct.replace(0, 1e-6)
-    leverage_ratio = (Config.TARGET_VOLATILITY / safe_vol).clip(upper=Config.MAX_LEVERAGE)
-    data['leverage_ratio'] = leverage_ratio
+    target_vol = getattr(Config, 'TARGET_VOLATILITY', 0.8)
+    raw_leverage_ratio = (target_vol / safe_vol)
     
-    # ==========================================
-    # 2. [V3.7 Update] 信号增强 (Signal Boosting)
-    # ==========================================
-    # 旧逻辑: / 20.0 (过于保守，导致平均杠杆极低)
-    # 新逻辑: / 10.0 (将 Forecast=10 视为满确信度)
-    # 效果: 在同等预测值下，基础仓位翻倍，显著提高资金利用率
-    ideal_position = (data[forecast_col] / 5.0) * leverage_ratio
+    # --- 3. 仓位计算 ---
+    # [V3.7] 信号增强: / 10.0
+    ideal_position = (data[forecast_col] / 2.0) * raw_leverage_ratio
     
-    # 硬性杠杆限制
-    ideal_position = ideal_position.clip(-Config.MAX_LEVERAGE, Config.MAX_LEVERAGE)
+    # [V4.0] 应用动态环境上限
+    ideal_position = ideal_position.clip(-dynamic_max_cap, dynamic_max_cap)
+    data['leverage_ratio'] = ideal_position.abs()
     
-    # 3. 灾难阻断器 (Survival Hard Stop)
+    # --- 4. 灾难阻断器 (Survival Hard Stop) [V3.3] ---
     h, l, c = data['high'], data['low'], data['close']
     pc = c.shift(1).fillna(c)
     tr = np.maximum(h - l, np.maximum((h - pc).abs(), (l - pc).abs()))
@@ -108,14 +159,14 @@ def calculate_position_target(df: pd.DataFrame, forecast_col='forecast', buffer=
     
     is_crash = hourly_ret < -crash_threshold
     
-    # 触发熔断
+    # 熔断归零
     ideal_position = np.where(is_crash, 0.0, ideal_position)
     
     data['sl_threshold'] = crash_threshold
     data['sigma_event'] = is_crash
     data['is_meltdown'] = is_crash
     
-    # 4. 缓冲器
+    # --- 5. 缓冲器 (Buffer) ---
     ideal_values = ideal_position
     n = len(ideal_values)
     buffered_position = np.zeros(n)
@@ -149,9 +200,17 @@ def run_vectorized_backtest(df: pd.DataFrame, fee_rate=0.0005, funding_rate=0.00
         sl_values = data.loc[risk_mask, 'sl_threshold']
         prev_close = data.loc[risk_mask, 'close'].shift(1)
         open_price = data.loc[risk_mask, 'open']
+        close_price = data.loc[risk_mask, 'close'] # 获取坑底收盘价
         
-        stop_price = open_price * (1.0 - sl_values)
-        correction = np.log(stop_price / prev_close)
+        # [V4.7 核心修正] 拒绝完美成交
+        # 假设你无法在半山腰止损，如果价格砸穿了，你只能在 Close 成交
+        theoretical_stop = open_price * (1.0 - sl_values)
+        execution_price = np.minimum(theoretical_stop, close_price)
+        
+        # 额外增加 0.2% 的滑点，模拟恐慌性抛售的冲击成本
+        final_exit_price = execution_price * (1.0 - 0.002) 
+        
+        correction = np.log(final_exit_price / prev_close)
         correction = correction.fillna(adjusted_market_ret.loc[risk_mask])
         adjusted_market_ret.loc[risk_mask] = correction
         
