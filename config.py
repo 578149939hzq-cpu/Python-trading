@@ -2,8 +2,8 @@ import os
 
 class Config:
     """
-    Jarvis-Code 全局配置中心 (V3.2 Simplified Edition)
-    回归原始信号，宽幅 ATR 动态风控。
+    Jarvis-Code 全局配置中心 (V3.3 Survival Edition)
+    Vol-Targeting 主导仓位 + 6.0x ATR 灾难阻断器。
     """
     
     # ==========================================
@@ -33,29 +33,44 @@ class Config:
     
     WEIGHTS = [0.25, 0.25, 0.25, 0.25]
     
-    # 保持 480 (长期稳健定仓)
-    VOL_LOOKBACK = 480
-
-    # ==========================================
-    # 3. 风险引擎 V3.2 (Relaxed ATR Risk)
-    # ==========================================
-    RISK_METRIC = 'ATR'
-    ATR_WINDOW = 24
+    # 长期波动率周期 (480小时)
+    # 用于平滑的仓位调整，这是策略的主引擎
+    VOL_LOOKBACK = 240
+    # [B] 均值回归模块 (Mean Reversion - RSI) [V4.0 New]
+    RSI_PERIOD = 14
+    # RSI 归一化系数: (50 - RSI) * Scalar
+    # 例如 RSI=70 (超买), Diff=-20, Scalar=1.0 -> Forecast=-20 (强空)
+    RSI_SCALAR = 1.0 
     
-    # [Config Change] 放宽至 6.0
-    # 6倍 ATR 是一个极宽的防线，意味着只有发生巨大的结构性破坏时才离场
-    # 避免被常规噪音止损
-    ATR_MULTIPLIER = 6.0 
+    # [C] 混合权重分配 (Signal Weights) [V4.0 New]
+    # 趋势 70% (进攻), RSI 30% (防守/反转)
+    TREND_WEIGHT = 0.7
+    RSI_WEIGHT = 0.3
+    # ==========================================
+    # 3. 风险管理 (Risk Management)
+    # ==========================================
+    # A. 波动率目标制 (Vol Scaling) - 负责日常风控
+    TARGET_VOLATILITY = 1.2
+    MAX_LEVERAGE = 2.5
     
-    MELTDOWN_DIRECTION = 'down'
-
-    # 基础风控
-    TARGET_VOLATILITY = 0.20
-    MAX_LEVERAGE = 2.0
+    # ------------------------------------------------
+    # [B] 环境过滤器 (Regime Filter) [V4.0 New]
+    # MA200 (日线) = 4800 (小时)
+    REGIME_MA_WINDOW = 4800
+    # 熊市/猴市下的杠杆上限 (当 Price < MA200)
+    # 开启保命模式，强制降杠杆
+    BEAR_MODE_MAX_LEVERAGE = 1.0
+    # 正常波动 (1x-3x ATR) 由波动率调仓自动处理，不触发硬止损。
+    
+    SURVIVAL_ATR_WINDOW = 24       # 快速感知崩盘 (1天)
+    SURVIVAL_ATR_MULTIPLIER = 4.5  # 极宽阈值 (约等于单小时暴跌 6%~10%)
+    
+    # 波动率地板 (防止死鱼行情误触，至少要跌够这个幅度才算崩盘)
+    MIN_HOURLY_VOL = 0.005 
     
     # ==========================================
     # 4. 回测仿真 (Simulation)
     # ==========================================
-    POSITION_BUFFER = 0.10 
+    POSITION_BUFFER = 0.1 
     FEE_RATE = 0.0005
     INITIAL_CAPITAL = 10000.0
