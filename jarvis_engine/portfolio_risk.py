@@ -1,10 +1,41 @@
 """
 风控与执行层：仓位目标计算（Regime + Vol Scaling + Survival + Buffer）与向量化回测。
-仓位缓冲器为状态机逻辑，保留原有实现；其余均为 Pandas/NumPy 向量化。
+仓位缓冲器：Numba 可用时用 @njit 加速，否则用纯 NumPy 数组的 Python 回退，保证无 Pandas 传入。
 """
 import pandas as pd
 import numpy as np
 from config import Config
+
+try:
+    from numba import njit
+
+    @njit
+    def _apply_buffer_state_machine(ideal_values: np.ndarray, buffer: float) -> np.ndarray:
+        n = ideal_values.shape[0]
+        buffered_position = np.empty(n, dtype=np.float64)
+        current_pos = 0.0
+        for i in range(n):
+            target = float(ideal_values[i])
+            if abs(target - current_pos) > buffer:
+                current_pos = target
+            buffered_position[i] = current_pos
+        return buffered_position
+
+    _USE_NUMBA = True
+except ImportError:
+    _USE_NUMBA = False
+
+    def _apply_buffer_state_machine(ideal_values: np.ndarray, buffer: float) -> np.ndarray:
+        """纯 Python 回退：入参必须为底层 numpy 数组，逻辑与 Numba 版一致。"""
+        n = ideal_values.shape[0]
+        buffered_position = np.empty(n, dtype=np.float64)
+        current_pos = 0.0
+        for i in range(n):
+            target = float(ideal_values[i])
+            if abs(target - current_pos) > buffer:
+                current_pos = target
+            buffered_position[i] = current_pos
+        return buffered_position
 
 
 def calculate_position_target(
@@ -73,15 +104,11 @@ def calculate_position_target(
     data["sigma_event"] = is_crash
     data["is_meltdown"] = is_crash
 
-    # --- 5. 缓冲器 (Buffer)：状态机，保留原有实现 ---
-    ideal_values = ideal_position
-    n = len(ideal_values)
-    buffered_position = np.zeros(n)
-    current_pos = 0.0
-    for i in range(n):
-        if abs(ideal_values[i] - current_pos) > buffer:
-            current_pos = ideal_values[i]
-        buffered_position[i] = current_pos
+    # --- 5. 缓冲器 (Buffer)：传入底层 numpy 数组（Series 用 .values），Numba 可用时走 njit，否则走 Python 回退 ---
+    ideal_values_array = np.asarray(
+        getattr(ideal_position, "values", ideal_position), dtype=np.float64
+    )
+    buffered_position = _apply_buffer_state_machine(ideal_values_array, float(buffer))
 
     data["raw_target"] = ideal_position
     data["buffered_pos"] = buffered_position

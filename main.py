@@ -233,79 +233,81 @@ def calculate_drawdown_metrics(equity_series):
         calmar = ann_ret / abs(max_drawdown)
         
     return max_drawdown, calmar
-def calculate_trade_metrics(df_res):
+def calculate_trade_metrics(df_res: pd.DataFrame) -> None:
 
     """
     [V3.7 Analytics] 交易维度统计
     将连续的持仓序列拆解为独立的 'Round-Trip' 交易进行统计。
+    使用纯 Pandas 向量化 groupby/agg 消除显式 Python 循环。
     """
     df = df_res.copy()
-    
+
     # 1. 定义交易分组 (Trade Grouping)
     # 逻辑: 只要仓位符号(多/空)发生变化，就算作新的一笔交易
     # 0 (空仓) 也会被分一组，后面会过滤掉
     # 精度过滤: 忽略 < 0.01 的微小仓位(可能是浮点误差)
-    df['pos_sign'] = np.sign(df['position'])
-    df.loc[df['position'].abs() < 0.01, 'pos_sign'] = 0
-    
+    df["pos_sign"] = np.sign(df["position"])
+    df.loc[df["position"].abs() < 0.01, "pos_sign"] = 0
+
     # 当符号变化时，累加 group_id
-    df['trade_id'] = (df['pos_sign'] != df['pos_sign'].shift(1)).cumsum()
-    
-    # 2. 聚合统计
-    # 只统计非空仓的组 (pos_sign != 0)
-    trade_stats = []
-    
+    df["trade_id"] = (df["pos_sign"] != df["pos_sign"].shift(1)).cumsum()
+
     # 获取时间索引 (假设索引是 datetime，如果不是请先转换)
     if not isinstance(df.index, pd.DatetimeIndex):
-         df.index = pd.to_datetime(df.index)
+        df.index = pd.to_datetime(df.index)
 
-    # 按交易ID分组
-    groups = df[df['pos_sign'] != 0].groupby('trade_id')
-    
-    for tid, group in groups:
-        # 基础数据
-        start_time = group.index[0]
-        end_time = group.index[-1]
-        
-        # 持续时长 (小时)
-        duration_hours = (end_time - start_time).total_seconds() / 3600
-        
-        # 交易总收益 (Sum of Log Returns)
-        # 注意: net_log_ret 已包含手续费和资金费
-        trade_ret = group['net_log_ret'].sum()
-        
-        # 记录
-        trade_stats.append({
-            'trade_id': tid,
-            'direction': 'Long' if group['pos_sign'].iloc[0] > 0 else 'Short',
-            'duration': duration_hours,
-            'return': trade_ret
-        })
-        
-    if not trade_stats:
+    # 2. 仅保留非空仓段，并向量化聚合
+    df_active = df[df["pos_sign"] != 0].copy()
+    if df_active.empty:
         print("⚠️ No trades executed.")
         return
-        
-    df_trades = pd.DataFrame(trade_stats)
-    
+
+    df_active = df_active.reset_index()
+    # 索引列名可能为 "index" 或 None 等，统一改为 timestamp 供 agg 使用
+    ts_col = df_active.columns[0]
+    df_active = df_active.rename(columns={ts_col: "timestamp"})
+
+    grouped = df_active.groupby("trade_id")
+    agg = grouped.agg(
+        start_time=("timestamp", "first"),
+        end_time=("timestamp", "last"),
+        pos_sign_first=("pos_sign", "first"),
+        trade_return=("net_log_ret", "sum"),
+    )
+
+    # 计算每笔交易的持续时间 (小时)
+    duration_hours = (
+        (agg["end_time"] - agg["start_time"]).dt.total_seconds() / 3600.0
+    )
+
+    # 方向与结果 DataFrame，与原实现字段保持一致
+    df_trades = agg.copy()
+    df_trades["duration"] = duration_hours
+    df_trades["direction"] = np.where(
+        df_trades["pos_sign_first"] > 0, "Long", "Short"
+    )
+    df_trades = df_trades.reset_index()[
+        ["trade_id", "direction", "duration", "trade_return"]
+    ].rename(columns={"trade_return": "return"})
+
     # 3. 计算核心指标
     total_trades = len(df_trades)
-    win_trades = len(df_trades[df_trades['return'] > 0])
-    loss_trades = len(df_trades[df_trades['return'] <= 0])
-    
-    win_rate = win_trades / total_trades if total_trades > 0 else 0
-    
+    win_trades = len(df_trades[df_trades["return"] > 0])
+    loss_trades = len(df_trades[df_trades["return"] <= 0])
+
+    win_rate = win_trades / total_trades if total_trades > 0 else 0.0
+
     # 盈亏比 (Profit Factor): 总盈利 / |总亏损|
-    gross_win = df_trades[df_trades['return'] > 0]['return'].sum()
-    gross_loss = abs(df_trades[df_trades['return'] <= 0]['return'].sum())
+    gross_win = df_trades[df_trades["return"] > 0]["return"].sum()
+    gross_loss = abs(df_trades[df_trades["return"] <= 0]["return"].sum())
     profit_factor = gross_win / gross_loss if gross_loss > 0 else np.inf
-    
+
     # 平均持仓 (小时)
-    avg_duration = df_trades['duration'].mean()
-    
+    avg_duration = df_trades["duration"].mean()
+
     # 平均单笔收益 (已扣费)
-    avg_pnl = df_trades['return'].mean()
-    
+    avg_pnl = df_trades["return"].mean()
+
     # 4. 打印战报
     print("\n📊 --- Trade Statistics (Round-Trip) ---")
     print(f"🔹 Total Trades    : {total_trades}")
@@ -313,7 +315,7 @@ def calculate_trade_metrics(df_res):
     print(f"🔹 Profit Factor   : {profit_factor:.2f}")
     print(f"🔹 Avg PnL / Trade : {avg_pnl:.2%}")
     print(f"🔹 Avg Duration    : {avg_duration:.1f} Hours ({avg_duration/24:.1f} Days)")
-    
+
     if win_rate < 0.4 and profit_factor > 1.2:
         print("✅ 风格: 典型的趋势策略 (低胜率，高盈亏比)。抓大放小。")
     elif win_rate > 0.5:
