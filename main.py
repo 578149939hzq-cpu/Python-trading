@@ -5,10 +5,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# 引入 Config
+# 引入 Config 与三层架构：数据 / 策略 / 风控执行
 from config import Config
-from jarvis_engine.alpha import load_price_data, calculate_scaled_forecast
-from jarvis_engine.alpha import calculate_position_target, run_vectorized_backtest
+from jarvis_engine.data_handler import CSVDataLoader
+from jarvis_engine.signal_generator import calculate_scaled_forecast
+from jarvis_engine.portfolio_risk import calculate_position_target, run_vectorized_backtest
 
 # ==========================================
 # 📊 全景战报 (Full History Report)
@@ -347,8 +348,9 @@ def mission_start():
     importlib.reload(config)
 
     print(f"📂 Data Path: {Config.DATA_PATH}")
-    
-    df = load_price_data(Config.DATA_PATH)
+
+    data_loader = CSVDataLoader(Config.DATA_PATH)
+    df = data_loader.fetch_data()
     if df.empty: 
         print("❌ Data not found.")
         return
